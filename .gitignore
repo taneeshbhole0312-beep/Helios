@@ -3,7 +3,7 @@
 # HELIOS - GITIGNORE
 # ==========================================
 
-# ---- Build directories ----
+# Build directories
 build/
 Build/
 cmake-build-*/
@@ -15,7 +15,7 @@ Release/
 x64/
 x86/
 
-# ---- Compiled binaries and objects ----
+# Compiled binaries and objects
 *.exe
 *.o
 *.obj
@@ -25,7 +25,7 @@ x86/
 *.idb
 *.exp
 
-# ---- CMake generated files ----
+# CMake generated files
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
@@ -33,27 +33,19 @@ compile_commands.json
 CTestTestfile.cmake
 Makefile
 
-# ---- Visual Studio ----
+# Visual Studio
 .vs/
-*.sln.docstates
 *.VC.db
 *.VC.VC.opendb
 
-# ---- Qt generated files ----
-moc_*.cpp
-ui_*.h
-qrc_*.cpp
-*.pro.user
-*.pro.user.*
-
-# ---- VS Code ----
+# VS Code
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
 
-# ---- Simulation outputs ----
+# Simulation output
 results/
 output/
 outputs/
@@ -64,16 +56,13 @@ logs/
 *.case
 *.plt
 
-# ---- Generated videos / images ----
+# Generated videos
 *.mp4
 *.avi
 *.mov
 *.mkv
-*.png
-*.jpg
-*.jpeg
 
-# ---- Temporary data ----
+# Temporary files
 *.tmp
 *.temp
 *.bak
@@ -81,12 +70,12 @@ logs/
 *.swp
 *~
 
-# ---- OS generated files ----
+# OS files
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# ---- Secrets / environment ----
+# Secrets
 .env
 .env.*
 !.env.example
