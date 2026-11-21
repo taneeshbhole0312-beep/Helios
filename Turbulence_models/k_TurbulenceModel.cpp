@@ -1204,10 +1204,6 @@ k_TurbulenceModels::SST_additions::SST_additions(k_TurbulenceModels &k_model_in)
 }
 
 // omega_min = c U_ref / L_ref.
-//   * U_ref is the reference velocity of the run, L_ref = min(turbulence length scale, longest domain side) (an eddy cannot be larger than the domain).
-//   * 1 / omega is the turbulence time scale, so omega_min says "no turbulent time scale longer than c flow-through times of an L_ref sized eddy". Equivalently
-//     the largest eddy viscosity the source can see is k / omega_min <= (k / U_ref^2) c^-1 U_ref L_ref, i.e. of the order of (velocity scale x length scale).
-//   * It is a floor on the DIVIDING omega only: omega itself (and with it mu_t, k, the production / destruction terms) is never touched by it.
 void k_TurbulenceModels::SST_additions::set_omega_floor(float reference_velocity, float turbulence_length_scale)
 {
     omega_min = 0.0f;
