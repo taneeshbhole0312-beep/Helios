@@ -78,4 +78,8 @@ desktop.ini
 # Secrets
 .env
 .env.*
+<<<<<<< HEAD
 !.env.example
+=======
+!.env.example
+>>>>>>> b594f01cd75e7e143c2eacff2567478d616fa850
