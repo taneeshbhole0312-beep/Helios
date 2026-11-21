@@ -112,3 +112,23 @@ Work towards making advanced multiphysics simulation accessible to inventors, re
 IMP: This roadmap represents the long-term direction of Helios. Development priorities and implementation details may evolve as the project progresses.
 
 
+## Contributing
+
+Helios is an open-source project, and contributions from developers, researchers, engineers and enthusiasts are welcome.
+
+There are many ways to contribute, including:
+
+- Developing and improving numerical methods and physical models.
+- Optimizing GPU compute kernels and memory management.
+- Testing and validating simulation results.
+- Improving rendering, visualization and debugging tools.
+- Reporting bugs and suggesting new features.
+- Improving documentation and helping make Helios more accessible.
+
+All code contributions should be submitted through pull requests and are subject to review before being merged.
+
+Since Helios is a scientific simulation project, numerical correctness, stability and physical validity are especially important. Contributions involving numerical methods or physical models should include appropriate testing and validation wherever possible.
+
+Please see `CONTRIBUTING.md` for development setup and contribution guidelines.
+
+
