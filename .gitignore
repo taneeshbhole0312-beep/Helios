@@ -1,0 +1,92 @@
+
+# ==========================================
+# HELIOS - GITIGNORE
+# ==========================================
+
+# ---- Build directories ----
+build/
+Build/
+cmake-build-*/
+out/
+bin/
+obj/
+Debug/
+Release/
+x64/
+x86/
+
+# ---- Compiled binaries and objects ----
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+*.pch
+*.idb
+*.exp
+
+# ---- CMake generated files ----
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Makefile
+
+# ---- Visual Studio ----
+.vs/
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+
+# ---- Qt generated files ----
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+*.pro.user
+*.pro.user.*
+
+# ---- VS Code ----
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# ---- Simulation outputs ----
+results/
+output/
+outputs/
+logs/
+*.vtk
+*.vtu
+*.foam
+*.case
+*.plt
+
+# ---- Generated videos / images ----
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+
+# ---- Temporary data ----
+*.tmp
+*.temp
+*.bak
+*.log
+*.swp
+*~
+
+# ---- OS generated files ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Secrets / environment ----
+.env
+.env.*
+!.env.example
