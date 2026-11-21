@@ -1,0 +1,432 @@
+#version 430 core
+
+layout( local_size_x = 8,
+        local_size_y = 8,
+        local_size_z = 8) in;
+
+
+// ============================================================
+// Uniforms
+// ============================================================
+
+// Cell-centered grid dimensions
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+
+// Physical spacing
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+// Fluid properties
+uniform float dynamic_viscosity;
+uniform float density;
+
+uniform float spalding_wall_smoothness;
+
+// false : fine grid, physical wall treatment (Spalding -> epsilon in the wall cells; row pinned to the wall value)
+// true  : coarse multigrid level, homogeneous correction condition e = 0 on the wall rows
+uniform bool coarse_assembly;
+
+const float kappa = 0.41;
+const float C_mu  = 0.09;
+
+// Newton stops when |F| < tolerance * y+. F = Re_y/u+ - y+(u+) is a difference of two O(y+) terms,
+// so an ABSOLUTE tolerance is unreachable in float32 once y+ is O(100+).
+const float spalding_relative_tolerance = 1e-5;
+
+// Coarse wall rows: the coarse RHS is the restricted residual (written by the solver, not by assembly) and is
+// generally NOT zero there, because a coarse wall cell also averages the first interior fine cell. A penalty
+// diagonal makes the row's correction r / penalty ~ 0 regardless of that RHS, i.e. homogeneous Dirichlet.
+const float coarse_homogeneous_penalty = 1e38;
+
+// ============================================================
+// Velocity fields - staggered
+// ============================================================
+
+// u: X-face centered, dimensions (grid_x + 1) x grid_y x grid_z
+layout(std430, binding = 0) readonly buffer UVelocity
+{
+    float u[];
+};
+
+// v: Y-face centered, dimensions grid_x x (grid_y + 1) x grid_z
+layout(std430, binding = 1) readonly buffer VVelocity
+{
+    float v[];
+};
+
+// w: Z-face centered, dimensions grid_x x grid_y x (grid_z + 1)
+layout(std430, binding = 2) readonly buffer WVelocity
+{
+    float w[];
+};
+// ============================================================
+// Turbulence field and the linear-system row that gets pinned in wall cells
+//
+// A wall cell row becomes   1.0 * eps_P = eps_wall   (all neighbour coefficients stay zero because every assembly
+// kernel skips cell-centered boundary cells and the coefficients are cleared before assembly).
+// ============================================================
+
+// Cell-centered epsilon
+layout(std430, binding = 3) buffer EpsilonField
+{
+    float eps[];
+};
+
+// Epsilon system
+layout(std430, binding = 4) buffer APEpsBuffer
+{
+    float aP_eps[];
+};
+
+layout(std430, binding = 5) buffer RHSEpsBuffer
+{
+    float RHS_eps[];
+};
+
+// ============================================================
+// Index helpers
+// ============================================================
+
+uint index_u(uint x, uint y, uint z)
+{
+    uint nx = grid_x + 1u;
+
+    return z * (nx * grid_y)
+         + y * nx
+         + x;
+}
+
+
+uint index_v(uint x, uint y, uint z)
+{
+    uint ny = grid_y + 1u;
+
+    return z * (grid_x * ny)
+         + y * grid_x
+         + x;
+}
+
+
+uint index_w(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+// Spalding: y+ = u+ + (1/E) [ exp(k u+) - 1 - k u+ - (k u+)^2 / 2 - (k u+)^3 / 6 ]
+float spalding_value(float u_plus)
+{
+
+    float inverse_E = 1.0 / spalding_wall_smoothness;
+
+    float ku = min(kappa * u_plus, 70.0);
+
+    float spalding_value = u_plus +
+                          (inverse_E *
+                          (exp(ku) - 1.0
+                          -(ku)
+                          -((ku * ku) / 2.0)
+                          -((ku * ku * ku) / 6.0)));
+
+    return spalding_value;
+}
+
+// d(y+)/d(u+) = 1 + (k/E) [ exp(k u+) - 1 - k u+ - (k u+)^2 / 2 ]   (>= 1 for u+ >= 0)
+float SpaldingDerivative(float u_plus)
+{
+    float ku = min(kappa * u_plus, 70.0);
+
+    return 1.0
+         + (kappa / spalding_wall_smoothness)
+         * (
+             exp(ku)
+             - 1.0
+             - ku
+             - (ku * ku) / 2.0
+           );
+}
+
+// F(u+) = Re_y / u+ - y+(u+)   ->   F'(u+) = -Re_y / u+^2 - y+'(u+)   (<= -1, never zero)
+float FDerivative(float u_plus, float local_Re)
+{
+    return -local_Re / (u_plus * u_plus)
+           - SpaldingDerivative(u_plus);
+}
+
+// u+ for a wall-normal-distance Reynolds number Re_y = Ut * y / nu: bracketed Newton on F(u+) = Re_y / u+ - y+(u+)
+float solve_u_plus(float local_Re)
+{
+    float spalding_B = log(spalding_wall_smoothness) / kappa;
+
+    // Form the initial guess for u+
+    float u_plus;
+    if (local_Re < 121.0)    //Viscous sub-layer for Re at y+ = 11
+    {
+        u_plus = sqrt(local_Re);    // local_Re = y+ * u+ and u+ = y+ in this layer
+    }
+    else
+    {
+        u_plus = (1.0 / kappa) * log(max(local_Re, 1.0)) + spalding_B;
+    }
+
+    //----------------------------------------------Bracket first time creation
+    float L = 0.8 * u_plus;    //an engineering choice to give 20 % variance range
+    float R = 1.2 * u_plus;    //an engineering choice to give 20 % variance range
+
+    float F_L;
+    float F_R;
+
+    bool bracket_found = false;
+    for (int iter = 0; iter < 30; iter++)
+    {
+        F_L = (local_Re / L) - spalding_value(L);
+        F_R = (local_Re / R) - spalding_value(R);
+
+        if(F_L * F_R < 0.0)
+        {
+            bracket_found = true;
+            break;
+        }
+        else
+        {
+            L = L / 2.0;
+            R = R * 2.0;
+        }
+
+    }
+
+    // FALL BACK MECHANISM: without a bracket the initial guess u_plus is used as-is. FLAG FALIURE IN THE FUTURE FOR THIS
+    if(bracket_found)
+    {
+        for (int iter = 0; iter < 20; iter++)
+        {
+            float current_iteration_spalding_value = spalding_value(u_plus);
+            float current_iteration_F_value = (local_Re / u_plus) - current_iteration_spalding_value;
+
+            float d_F_spalding = FDerivative(u_plus, local_Re);
+
+            float Newton_candidate = u_plus - (current_iteration_F_value / d_F_spalding);
+
+            if(Newton_candidate > L && Newton_candidate < R)
+            {
+                u_plus = Newton_candidate;
+            }
+            else
+            {
+                u_plus = (L + R) / 2.0;
+            }
+
+            float New_spalding_value = spalding_value(u_plus);
+            float New_F_value = (local_Re / u_plus) - New_spalding_value;
+
+            if (abs(New_F_value) < spalding_relative_tolerance * (local_Re / u_plus))
+                break;
+
+
+            if(F_L * New_F_value < 0.0)
+            {
+                R = u_plus;       //u_plus_new
+                F_R = New_F_value;
+            }
+            else
+            {
+                L = u_plus;
+                F_L = New_F_value;
+            }
+        }
+    }
+
+    return u_plus;
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+
+    if (x >= grid_x || y >= grid_y || z >= grid_z)
+        return;
+
+    uint id = index_cell(x, y, z);
+
+    // --------------------------------------------------------
+    // Determine which walls this cell touches
+    // --------------------------------------------------------
+
+    bool wall_x_min = (x == 0u);
+    bool wall_x_max = (x == grid_x - 1u);
+
+    bool wall_y_min = (y == 0u);
+    bool wall_y_max = (y == grid_y - 1u);
+
+    bool wall_z_min = (z == 0u);
+    bool wall_z_max = (z == grid_z - 1u);
+
+
+    bool is_wall_cell =
+        wall_x_min || wall_x_max ||
+        wall_y_min || wall_y_max ||
+        wall_z_min || wall_z_max;
+
+
+    if (!is_wall_cell)
+        return;
+
+
+    // --------------------------------------------------------
+    // Coarse levels: off-diagonals of wall rows are already zero (every assembly kernel skips
+    // cell-centered boundary cells), so only the diagonal (binding 4) is set. Velocity, field
+    // and RHS bindings are not touched in this mode.
+    // --------------------------------------------------------
+
+    if (coarse_assembly)
+    {
+        aP_eps[id] = coarse_homogeneous_penalty;
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Cell-center velocity from staggered fields
+    // (x + 1 <= grid_x, y + 1 <= grid_y, z + 1 <= grid_z: always inside the face arrays)
+    // --------------------------------------------------------
+
+    float u_c =
+        0.5 * (
+            u[index_u(x,     y, z)] +
+            u[index_u(x + 1u, y, z)]
+        );
+
+    float v_c =
+        0.5 * (
+            v[index_v(x, y,     z)] +
+            v[index_v(x, y + 1u, z)]
+        );
+
+    float w_c =
+        0.5 * (
+            w[index_w(x, y, z)] +
+            w[index_w(x, y, z + 1u)]
+        );
+
+    // --------------------------------------------------------
+    // Wall-treatment accumulation
+    // --------------------------------------------------------
+
+    float eps_sum    = 0.0;
+    float weight_sum = 0.0;
+
+    // ========================================================
+    // X walls
+    // ========================================================
+
+    if (wall_x_min || wall_x_max)
+    {
+        // Distance from cell center to X wall (same for x = 0 and x = grid_x - 1).
+        float wall_distance_x = 0.5 * dx;
+
+        // Tangential velocity to an X-normal wall (u is wall-normal).
+        float Ut_x = sqrt(v_c * v_c + w_c * w_c);
+
+        if(Ut_x > 1e-8)
+        {
+            float local_Re = (Ut_x * wall_distance_x) / (dynamic_viscosity / density);
+
+            float u_plus = solve_u_plus(local_Re);
+
+            float u_tau = Ut_x / (u_plus + 1e-8);
+
+            float weight = 1.0 / wall_distance_x;
+            eps_sum += ((u_tau * u_tau * u_tau) / (kappa * wall_distance_x)) * weight;
+            weight_sum += weight;
+        }
+    }
+
+    // ========================================================
+    // Y walls
+    // ========================================================
+
+    if (wall_y_min || wall_y_max)
+    {
+        // Distance from cell center to Y wall (same for y = 0 and y = grid_y - 1).
+        float wall_distance_y = 0.5 * dy;
+
+        // Tangential velocity to an Y-normal wall (v is wall-normal).
+        float Ut_y = sqrt(u_c * u_c + w_c * w_c);
+
+        if(Ut_y > 1e-8)
+        {
+            float local_Re = (Ut_y * wall_distance_y) / (dynamic_viscosity / density);
+
+            float u_plus = solve_u_plus(local_Re);
+
+            float u_tau = Ut_y / (u_plus + 1e-8);
+
+            float weight = 1.0 / wall_distance_y;
+            eps_sum += ((u_tau * u_tau * u_tau) / (kappa * wall_distance_y)) * weight;
+            weight_sum += weight;
+        }
+    }
+
+    // ========================================================
+    // Z walls
+    // ========================================================
+
+    if (wall_z_min || wall_z_max)
+    {
+        // Distance from cell center to Z wall (same for z = 0 and z = grid_z - 1).
+        float wall_distance_z = 0.5 * dz;
+
+        // Tangential velocity to an Z-normal wall (w is wall-normal).
+        float Ut_z = sqrt(u_c * u_c + v_c * v_c);
+
+        if(Ut_z > 1e-8)
+        {
+            float local_Re = (Ut_z * wall_distance_z) / (dynamic_viscosity / density);
+
+            float u_plus = solve_u_plus(local_Re);
+
+            float u_tau = Ut_z / (u_plus + 1e-8);
+
+            float weight = 1.0 / wall_distance_z;
+            eps_sum += ((u_tau * u_tau * u_tau) / (kappa * wall_distance_z)) * weight;
+            weight_sum += weight;
+        }
+    }
+
+    // ========================================================
+    // Combine wall contributions
+    // (weight_sum == 0 only if every touching wall has Ut <= 1e-8: eps keeps its current value)
+    // ========================================================
+
+    if (weight_sum > 0.0)
+    {
+        eps[id] = eps_sum / weight_sum;
+    }
+
+    // ========================================================
+    // Pin the wall-cell row:  1.0 * eps_P = eps_wall
+    // Done for EVERY wall cell, including the zero-Ut ones (pinned to their current value),
+    // so the smoother never divides by aP == 0.
+    // ========================================================
+
+    aP_eps[id]  = 1.0;
+    RHS_eps[id] = eps[id];
+}

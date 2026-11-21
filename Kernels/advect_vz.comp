@@ -1,0 +1,578 @@
+// Advection of vz on the 3D MAC grid (dual-state WENO reconstruction + upwind flux).
+// Self-advection direction = z (top/bottom).  Cross directions = x (east/west) and y (north/south).
+// Reconstructed vels are the vels at the control volume faces, NOT the pressure cell faces.
+//
+// Grid layouts (3D MAC):
+//   vx :  (cells_x + 1) * cells_y       * cells_z
+//   vy :   cells_x      * (cells_y + 1) * cells_z
+//   vz :   cells_x      * cells_y       * (cells_z + 1)   <- this kernel's own field
+
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;      //512 invocations, safely under the 1024 guaranteed limit
+
+layout(std430, binding = 0)
+buffer MACvzBuffer
+{
+    float MAC_vz[];
+};
+
+layout(std430, binding = 1)
+buffer readonly MACvxBuffer
+{
+    float MAC_vx[];
+};
+
+layout(std430, binding = 2)
+buffer readonly MACvyBuffer
+{
+    float MAC_vy[];
+};
+
+layout(std430, binding = 3)
+buffer writeonly MACV_tempBuffer
+{
+    float MAC_vz_buffer[];
+};
+
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+uniform float cell_side_x;
+uniform float cell_side_y;
+uniform float cell_side_z;
+uniform float stable_dt;
+
+float reconstruct_vx_east(uint idx, uint x, uint y)
+{
+    //Main stencil (x-direction; "minus" = west / smaller x, "plus" = east / larger x)
+    // vz grid has cells_x columns (max col cells_x - 1), so the +x side must be clamped
+    uint center = idx;
+    uint idx_plus_1 = (x < cells_x - 1) ? idx + 1 : idx;
+    uint idx_plus_2 = (x < cells_x - 2) ? idx + 2 : idx;
+    uint idx_minus_1 = (x > 0) ? idx - 1 : idx;
+    uint idx_minus_2 = (x > 1) ? idx - 2 : idx;
+    //--------------------------------------------------------------------------------EAST FACE
+    float vel_center = MAC_vz[center];
+    float vel_idx_minus_1 = MAC_vz[idx_minus_1];
+    float vel_idx_minus_2 = MAC_vz[idx_minus_2];
+    float vel_idx_plus_1 = MAC_vz[idx_plus_1];
+    float vel_idx_plus_2 = MAC_vz[idx_plus_2];
+
+    float candidate_0 = ((1.0 / 3.0) * vel_idx_minus_2) - ((7.0 / 6.0) * vel_idx_minus_1) + ((11.0 / 6.0) * vel_center);
+    float candidate_1 = ((-1.0 / 6.0) * vel_idx_minus_1) + ((5.0 / 6.0) * vel_center) + ((1.0 / 3.0) * vel_idx_plus_1);
+    float candidate_2 = ((1.0 / 3.0) * vel_center) + ((5.0 / 6.0) * vel_idx_plus_1) - ((1.0 / 6.0) * vel_idx_plus_2);
+
+    //----------------------------------------------------------------------------------- Betas section
+
+    float beta_0_part_1 = (vel_idx_minus_2 - (2.0 * vel_idx_minus_1) + vel_center);
+    float beta_0_part_2 = (vel_idx_minus_2 - (4.0 * vel_idx_minus_1) + (3.0 * vel_center));
+    float beta_0 = ((13.0 / 12.0) * (beta_0_part_1 * beta_0_part_1)) + (0.25 * (beta_0_part_2 * beta_0_part_2));
+
+    float beta_1_part_1 = (vel_idx_minus_1 - (2.0 * vel_center) + vel_idx_plus_1);
+    float beta_1_part_2 = vel_idx_minus_1 - vel_idx_plus_1;
+    float beta_1 = ((13.0 / 12.0) * (beta_1_part_1 * beta_1_part_1)) + (0.25 * (beta_1_part_2 * beta_1_part_2));
+
+    float beta_2_part_1 = (vel_center - (2.0 * vel_idx_plus_1) + vel_idx_plus_2);
+    float beta_2_part_2 = ((3.0 * vel_center) - (4.0 * vel_idx_plus_1) + vel_idx_plus_2);
+    float beta_2 = ((13.0 / 12.0) * (beta_2_part_1 * beta_2_part_1)) + (0.25 * (beta_2_part_2 * beta_2_part_2));
+
+    // ------------------------------------------------ Global smoothness indicator
+    float global_smoothness = abs(beta_0 - beta_2);
+
+    //------------------------------------------------ Un-normalized weights (alpha)
+    float d_0 = 1.0 / 10.0;
+    float d_1 = 6.0 / 10.0;              //east and south face focused ideal weights
+    float d_2 = 3.0 / 10.0;
+
+    float eps = 1e-6;
+
+    float alpha_0 = d_0 * (1.0 + ((global_smoothness / (beta_0 + eps)) * (global_smoothness / (beta_0 + eps))));
+    float alpha_1 = d_1 * (1.0 + ((global_smoothness / (beta_1 + eps)) * (global_smoothness / (beta_1 + eps))));
+    float alpha_2 = d_2 * (1.0 + ((global_smoothness / (beta_2 + eps)) * (global_smoothness / (beta_2 + eps))));
+
+    //---------------------------------------------final normalized weights
+    float sum_of_alphas = alpha_0 + alpha_1 + alpha_2;
+
+    float weight_0 = alpha_0 / sum_of_alphas;
+    float weight_1 = alpha_1 / sum_of_alphas;
+    float weight_2 = alpha_2 / sum_of_alphas;
+
+    //------------------------------------------------- Final recontructed  velocity
+
+    float final_velocity = (candidate_0 * weight_0) + (candidate_1 * weight_1) + (candidate_2 * weight_2);
+
+    return final_velocity;
+}
+
+float reconstruct_vx_west(uint idx, uint x, uint y)
+{
+    //Main stencil
+    uint center = idx;
+    uint idx_plus_1 = (x < cells_x - 1) ? idx + 1 : idx;
+    uint idx_plus_2 = (x < cells_x - 2) ? idx + 2 : idx;
+    uint idx_minus_1 = (x > 0) ? idx - 1 : idx;
+    uint idx_minus_2 = (x > 1) ? idx - 2 : idx;
+
+    float vel_center = MAC_vz[center];
+    float vel_idx_minus_1 = MAC_vz[idx_minus_1];
+    float vel_idx_minus_2 = MAC_vz[idx_minus_2];
+    float vel_idx_plus_1 = MAC_vz[idx_plus_1];
+    float vel_idx_plus_2 = MAC_vz[idx_plus_2];
+
+    float candidate_0_w = ((11.0 / 6.0) * vel_center) - ((7.0 / 6.0) * vel_idx_plus_1) + ((1.0 / 3.0) * vel_idx_plus_2);
+
+    float candidate_1_w = ((1.0 / 3.0) * vel_idx_minus_1) + ((5.0 / 6.0) * vel_center) - ((1.0 / 6.0) * vel_idx_plus_1);
+
+    float candidate_2_w = ((1.0 / 3.0) * vel_center) + ((5.0 / 6.0) * vel_idx_minus_1) - ((1.0 / 6.0) * vel_idx_minus_2);
+
+    //----------------------------------------------------------------------------------- Betas section (west face)
+
+    float beta_0_w_part_1 = (vel_idx_plus_2 - (2.0 * vel_idx_plus_1) + vel_center);
+    float beta_0_w_part_2 = (vel_idx_plus_2 - (4.0 * vel_idx_plus_1) + (3.0 * vel_center));
+    float beta_0_w = ((13.0 / 12.0) * (beta_0_w_part_1 * beta_0_w_part_1)) + (0.25 * (beta_0_w_part_2 * beta_0_w_part_2));
+
+    float beta_1_w_part_1 = (vel_idx_plus_1 - (2.0 * vel_center) + vel_idx_minus_1);
+    float beta_1_w_part_2 = vel_idx_plus_1 - vel_idx_minus_1;
+    float beta_1_w = ((13.0 / 12.0) * (beta_1_w_part_1 * beta_1_w_part_1)) + (0.25 * (beta_1_w_part_2 * beta_1_w_part_2));
+
+    float beta_2_w_part_1 = (vel_center - (2.0 * vel_idx_minus_1) + vel_idx_minus_2);
+    float beta_2_w_part_2 = ((3.0 * vel_center) - (4.0 * vel_idx_minus_1) + vel_idx_minus_2);
+    float beta_2_w = ((13.0 / 12.0) * (beta_2_w_part_1 * beta_2_w_part_1)) + (0.25 * (beta_2_w_part_2 * beta_2_w_part_2));
+
+    //----------------------------------------------------------------------------------- Global smoothness indicator
+    float global_smoothness_w = abs(beta_0_w - beta_2_w);
+
+    //----------------------------------------------------------------------------------- Ideal weights (mirrored)
+    float d_0_w = 1.0 / 10.0;
+    float d_1_w = 6.0 / 10.0;
+    float d_2_w = 3.0 / 10.0;
+
+    float eps_w = 1e-6;
+
+    float r0_w = global_smoothness_w / (beta_0_w + eps_w);
+    float r1_w = global_smoothness_w / (beta_1_w + eps_w);
+    float r2_w = global_smoothness_w / (beta_2_w + eps_w);
+
+    float alpha_0_w = d_0_w * (1.0 + r0_w * r0_w);
+    float alpha_1_w = d_1_w * (1.0 + r1_w * r1_w);
+    float alpha_2_w = d_2_w * (1.0 + r2_w * r2_w);
+
+    float sum_of_alphas_w = alpha_0_w + alpha_1_w + alpha_2_w;
+
+    float weight_0_w = alpha_0_w / sum_of_alphas_w;
+    float weight_1_w = alpha_1_w / sum_of_alphas_w;
+    float weight_2_w = alpha_2_w / sum_of_alphas_w;
+
+    float final_velocity = (candidate_0_w * weight_0_w) + (candidate_1_w * weight_1_w) + (candidate_2_w * weight_2_w);
+
+    return final_velocity;
+}
+
+float reconstruct_vy_south(uint idx, uint x, uint y)
+{
+    uint stride_y = cells_x;
+
+    // /Main stencil (y-direction; "minus" = north / smaller y, "plus" = south / larger y)
+    // vz grid has cells_y rows (max row cells_y - 1), so the +y side must be clamped
+    uint center = idx;
+    uint idx_plus_1 = (y < cells_y - 1) ? idx + stride_y : idx;
+    uint idx_plus_2 = (y < cells_y - 2) ? idx + 2 * stride_y : idx;
+    uint idx_minus_1 = (y > 0) ? idx - stride_y : idx;
+    uint idx_minus_2 = (y > 1) ? idx - 2 * stride_y : idx;
+
+    float vel_center = MAC_vz[center];
+    float vel_idx_minus_1 = MAC_vz[idx_minus_1];
+    float vel_idx_minus_2 = MAC_vz[idx_minus_2];
+    float vel_idx_plus_1 = MAC_vz[idx_plus_1];
+    float vel_idx_plus_2 = MAC_vz[idx_plus_2];
+
+    //--------------------------------------------------------------------------------SOUTH FACE (left/upwind-for-+y state)
+    float candidate_0 = ((1.0 / 3.0) * vel_idx_minus_2) - ((7.0 / 6.0) * vel_idx_minus_1) + ((11.0 / 6.0) * vel_center);
+    float candidate_1 = ((-1.0 / 6.0) * vel_idx_minus_1) + ((5.0 / 6.0) * vel_center) + ((1.0 / 3.0) * vel_idx_plus_1);
+    float candidate_2 = ((1.0 / 3.0) * vel_center) + ((5.0 / 6.0) * vel_idx_plus_1) - ((1.0 / 6.0) * vel_idx_plus_2);
+
+    //----------------------------------------------------------------------------------- Betas section
+
+    float beta_0_part_1 = (vel_idx_minus_2 - (2.0 * vel_idx_minus_1) + vel_center);
+    float beta_0_part_2 = (vel_idx_minus_2 - (4.0 * vel_idx_minus_1) + (3.0 * vel_center));
+    float beta_0 = ((13.0 / 12.0) * (beta_0_part_1 * beta_0_part_1)) + (0.25 * (beta_0_part_2 * beta_0_part_2));
+
+    float beta_1_part_1 = (vel_idx_minus_1 - (2.0 * vel_center) + vel_idx_plus_1);
+    float beta_1_part_2 = vel_idx_minus_1 - vel_idx_plus_1;
+    float beta_1 = ((13.0 / 12.0) * (beta_1_part_1 * beta_1_part_1)) + (0.25 * (beta_1_part_2 * beta_1_part_2));
+
+    float beta_2_part_1 = (vel_center - (2.0 * vel_idx_plus_1) + vel_idx_plus_2);
+    float beta_2_part_2 = ((3.0 * vel_center) - (4.0 * vel_idx_plus_1) + vel_idx_plus_2);
+    float beta_2 = ((13.0 / 12.0) * (beta_2_part_1 * beta_2_part_1)) + (0.25 * (beta_2_part_2 * beta_2_part_2));
+
+    // ------------------------------------------------ Global smoothness indicator
+    float global_smoothness = abs(beta_0 - beta_2);
+
+    //------------------------------------------------ Un-normalized weights (alpha)
+    float d_0 = 1.0 / 10.0;
+    float d_1 = 6.0 / 10.0;              //east and south face focused ideal weights
+    float d_2 = 3.0 / 10.0;
+
+    float eps = 1e-6;
+
+    float alpha_0 = d_0 * (1.0 + ((global_smoothness / (beta_0 + eps)) * (global_smoothness / (beta_0 + eps))));
+    float alpha_1 = d_1 * (1.0 + ((global_smoothness / (beta_1 + eps)) * (global_smoothness / (beta_1 + eps))));
+    float alpha_2 = d_2 * (1.0 + ((global_smoothness / (beta_2 + eps)) * (global_smoothness / (beta_2 + eps))));
+
+    //---------------------------------------------final normalized weights
+    float sum_of_alphas = alpha_0 + alpha_1 + alpha_2;
+
+    float weight_0 = alpha_0 / sum_of_alphas;
+    float weight_1 = alpha_1 / sum_of_alphas;
+    float weight_2 = alpha_2 / sum_of_alphas;
+
+    //------------------------------------------------- Final recontructed  velocity
+
+    float final_velocity = (candidate_0 * weight_0) + (candidate_1 * weight_1) + (candidate_2 * weight_2);
+
+    return final_velocity;
+}
+
+float reconstruct_vy_north(uint idx, uint x, uint y)
+{
+    uint stride_y = cells_x;
+
+    uint center = idx;
+    uint idx_plus_1 = (y < cells_y - 1) ? idx + stride_y : idx;
+    uint idx_plus_2 = (y < cells_y - 2) ? idx + 2 * stride_y : idx;
+    uint idx_minus_1 = (y > 0) ? idx - stride_y : idx;
+    uint idx_minus_2 = (y > 1) ? idx - 2 * stride_y : idx;
+
+    float vel_center = MAC_vz[center];
+    float vel_idx_minus_1 = MAC_vz[idx_minus_1];
+    float vel_idx_minus_2 = MAC_vz[idx_minus_2];
+    float vel_idx_plus_1 = MAC_vz[idx_plus_1];
+    float vel_idx_plus_2 = MAC_vz[idx_plus_2];
+
+    //----------------------------------------------------------------------------------- NORTH FACE reconstruction
+    // Reconstruct the right state at the north face of cell j (face between j-1 and j).
+    // Mirror of the south reconstruction (same 5-point stencil, mirrored candidates/betas).
+
+    float candidate_0_n = ((11.0 / 6.0) * vel_center) - ((7.0 / 6.0) * vel_idx_plus_1) + ((1.0 / 3.0) * vel_idx_plus_2);
+
+    float candidate_1_n = ((1.0 / 3.0) * vel_idx_minus_1) + ((5.0 / 6.0) * vel_center) - ((1.0 / 6.0) * vel_idx_plus_1);
+
+    float candidate_2_n = ((1.0 / 3.0) * vel_center) + ((5.0 / 6.0) * vel_idx_minus_1) - ((1.0 / 6.0) * vel_idx_minus_2);
+
+    //----------------------------------------------------------------------------------- Betas section (north face)
+
+    float beta_0_n_part_1 = (vel_idx_plus_2 - (2.0 * vel_idx_plus_1) + vel_center);
+    float beta_0_n_part_2 = (vel_idx_plus_2 - (4.0 * vel_idx_plus_1) + (3.0 * vel_center));
+    float beta_0_n = ((13.0 / 12.0) * (beta_0_n_part_1 * beta_0_n_part_1)) + (0.25 * (beta_0_n_part_2 * beta_0_n_part_2));
+
+    float beta_1_n_part_1 = (vel_idx_plus_1 - (2.0 * vel_center) + vel_idx_minus_1);
+    float beta_1_n_part_2 = vel_idx_plus_1 - vel_idx_minus_1;
+    float beta_1_n = ((13.0 / 12.0) * (beta_1_n_part_1 * beta_1_n_part_1)) + (0.25 * (beta_1_n_part_2 * beta_1_n_part_2));
+
+    float beta_2_n_part_1 = (vel_center - (2.0 * vel_idx_minus_1) + vel_idx_minus_2);
+    float beta_2_n_part_2 = ((3.0 * vel_center) - (4.0 * vel_idx_minus_1) + vel_idx_minus_2);
+    float beta_2_n = ((13.0 / 12.0) * (beta_2_n_part_1 * beta_2_n_part_1)) + (0.25 * (beta_2_n_part_2 * beta_2_n_part_2));
+
+    //----------------------------------------------------------------------------------- Global smoothness indicator
+    float global_smoothness_n = abs(beta_0_n - beta_2_n);
+
+    //----------------------------------------------------------------------------------- Ideal weights (mirrored)
+    float d_0_n = 1.0 / 10.0;
+    float d_1_n = 6.0 / 10.0;
+    float d_2_n = 3.0 / 10.0;
+
+    float eps_n = 1e-6;
+
+    float r0_n = global_smoothness_n / (beta_0_n + eps_n);
+    float r1_n = global_smoothness_n / (beta_1_n + eps_n);
+    float r2_n = global_smoothness_n / (beta_2_n + eps_n);
+
+    float alpha_0_n = d_0_n * (1.0 + r0_n * r0_n);
+    float alpha_1_n = d_1_n * (1.0 + r1_n * r1_n);
+    float alpha_2_n = d_2_n * (1.0 + r2_n * r2_n);
+
+    float sum_of_alphas_n = alpha_0_n + alpha_1_n + alpha_2_n;
+
+    float weight_0_n = alpha_0_n / sum_of_alphas_n;
+    float weight_1_n = alpha_1_n / sum_of_alphas_n;
+    float weight_2_n = alpha_2_n / sum_of_alphas_n;
+
+    float final_velocity = (candidate_0_n * weight_0_n) + (candidate_1_n * weight_1_n) + (candidate_2_n * weight_2_n);
+
+    return final_velocity;
+}
+
+float reconstruct_vz_top(uint idx, uint x, uint y, uint z)
+{
+    // vz grid layer stride: one full x-y plane of the vz lattice
+    uint layer_stride = uint(cells_x) * uint(cells_y);
+
+    //Main stencil (z-direction; "minus" = top / smaller z, "plus" = bottom / larger z)
+    // vz grid has cells_z + 1 layers (max layer cells_z), so the +z side has room
+    uint center = idx;
+    uint idx_plus_1  = (z < uint(cells_z)) ? idx + layer_stride : idx;
+    uint idx_plus_2  = (z < uint(cells_z - 1)) ? idx + 2u * layer_stride : idx;
+    uint idx_minus_1 = (z > 0u) ? idx - layer_stride : idx;
+    uint idx_minus_2 = (z > 1u) ? idx - 2u * layer_stride : idx;
+
+    float vel_center      = MAC_vz[center];
+    float vel_idx_minus_1 = MAC_vz[idx_minus_1];
+    float vel_idx_minus_2 = MAC_vz[idx_minus_2];
+    float vel_idx_plus_1  = MAC_vz[idx_plus_1];
+    float vel_idx_plus_2  = MAC_vz[idx_plus_2];
+
+    //--------------------------------------------------------------------------------TOP FACE (left/upwind-for-+z state)
+    float candidate_0 = (1.0 / 3.0) * vel_idx_minus_2 - (7.0 / 6.0) * vel_idx_minus_1 + (11.0 / 6.0) * vel_center;
+
+    float candidate_1 = -(1.0 / 6.0) * vel_idx_minus_1 + (5.0 / 6.0) * vel_center + (1.0 / 3.0) * vel_idx_plus_1;
+
+    float candidate_2 = (1.0 / 3.0) * vel_center + (5.0 / 6.0) * vel_idx_plus_1 - (1.0 / 6.0) * vel_idx_plus_2;
+
+    //----------------------------------------------------------------------------------- Betas section
+
+    float beta_0_part_1 = vel_idx_minus_2 - 2.0 * vel_idx_minus_1 + vel_center;
+    float beta_0_part_2 = vel_idx_minus_2 - 4.0 * vel_idx_minus_1 + 3.0 * vel_center;
+    float beta_0 = (13.0 / 12.0) * beta_0_part_1 * beta_0_part_1 + 0.25 * beta_0_part_2 * beta_0_part_2;
+
+    float beta_1_part_1 = vel_idx_minus_1 - 2.0 * vel_center + vel_idx_plus_1;
+    float beta_1_part_2 = vel_idx_minus_1 - vel_idx_plus_1;
+    float beta_1 = (13.0 / 12.0) * beta_1_part_1 * beta_1_part_1 + 0.25 * beta_1_part_2 * beta_1_part_2;
+
+    float beta_2_part_1 = vel_center - 2.0 * vel_idx_plus_1 + vel_idx_plus_2;
+    float beta_2_part_2 = 3.0 * vel_center - 4.0 * vel_idx_plus_1 + vel_idx_plus_2;
+    float beta_2 = (13.0 / 12.0) * beta_2_part_1 * beta_2_part_1 + 0.25 * beta_2_part_2 * beta_2_part_2;
+
+    //----------------------------------------------------------------------------------- Global smoothness indicator
+    float global_smoothness = abs(beta_0 - beta_2);
+
+    //----------------------------------------------------------------------------------- Ideal weights
+    float d_0 = 1.0 / 10.0;
+    float d_1 = 6.0 / 10.0;
+    float d_2 = 3.0 / 10.0;
+    float eps = 1e-6;
+
+    float r0 = global_smoothness / (beta_0 + eps);
+    float r1 = global_smoothness / (beta_1 + eps);
+    float r2 = global_smoothness / (beta_2 + eps);
+
+    float alpha_0 = d_0 * (1.0 + r0 * r0);
+    float alpha_1 = d_1 * (1.0 + r1 * r1);
+    float alpha_2 = d_2 * (1.0 + r2 * r2);
+
+    float sum_of_alphas = alpha_0 + alpha_1 + alpha_2;
+
+    float weight_0 = alpha_0 / sum_of_alphas;
+    float weight_1 = alpha_1 / sum_of_alphas;
+    float weight_2 = alpha_2 / sum_of_alphas;
+
+    return candidate_0 * weight_0 + candidate_1 * weight_1 + candidate_2 * weight_2;
+}
+
+float reconstruct_vz_bottom(uint idx, uint x, uint y, uint z)
+{
+    uint layer_stride = uint(cells_x) * uint(cells_y);
+
+    uint center = idx;
+    uint idx_plus_1  = (z < uint(cells_z)) ? idx + layer_stride : idx;
+    uint idx_plus_2  = (z < uint(cells_z - 1)) ? idx + 2u * layer_stride : idx;
+    uint idx_minus_1 = (z > 0u) ? idx - layer_stride : idx;
+    uint idx_minus_2 = (z > 1u) ? idx - 2u * layer_stride : idx;
+
+    float vel_center      = MAC_vz[center];
+    float vel_idx_minus_1 = MAC_vz[idx_minus_1];
+    float vel_idx_minus_2 = MAC_vz[idx_minus_2];
+    float vel_idx_plus_1  = MAC_vz[idx_plus_1];
+    float vel_idx_plus_2  = MAC_vz[idx_plus_2];
+
+    //----------------------------------------------------------------------------------- BOTTOM FACE reconstruction
+    // Reconstruct the right state at the bottom face of cell k (face between k and k+1).
+    // Mirror of the top reconstruction (same 5-point stencil, mirrored candidates/betas).
+
+    float candidate_0 = (11.0 / 6.0) * vel_center - (7.0 / 6.0) * vel_idx_plus_1 + (1.0 / 3.0) * vel_idx_plus_2;
+
+    float candidate_1 = (1.0 / 3.0) * vel_idx_minus_1 + (5.0 / 6.0) * vel_center - (1.0 / 6.0) * vel_idx_plus_1;
+
+    float candidate_2 = (1.0 / 3.0) * vel_center + (5.0 / 6.0) * vel_idx_minus_1 - (1.0 / 6.0) * vel_idx_minus_2;
+
+    //----------------------------------------------------------------------------------- Betas section (bottom face)
+
+    float beta_0_part_1 = vel_idx_plus_2 - 2.0 * vel_idx_plus_1 + vel_center;
+    float beta_0_part_2 = vel_idx_plus_2 - 4.0 * vel_idx_plus_1 + 3.0 * vel_center;
+    float beta_0 = (13.0 / 12.0) * beta_0_part_1 * beta_0_part_1 + 0.25 * beta_0_part_2 * beta_0_part_2;
+
+    float beta_1_part_1 = vel_idx_plus_1 - 2.0 * vel_center + vel_idx_minus_1;
+    float beta_1_part_2 = vel_idx_plus_1 - vel_idx_minus_1;
+    float beta_1 = (13.0 / 12.0) * beta_1_part_1 * beta_1_part_1 + 0.25 * beta_1_part_2 * beta_1_part_2;
+
+    float beta_2_part_1 = vel_center - 2.0 * vel_idx_minus_1 + vel_idx_minus_2;
+    float beta_2_part_2 = 3.0 * vel_center - 4.0 * vel_idx_minus_1 + vel_idx_minus_2;
+    float beta_2 = (13.0 / 12.0) * beta_2_part_1 * beta_2_part_1 + 0.25 * beta_2_part_2 * beta_2_part_2;
+
+    //----------------------------------------------------------------------------------- Global smoothness indicator
+    float global_smoothness = abs(beta_0 - beta_2);
+
+    //----------------------------------------------------------------------------------- Ideal weights (mirrored)
+    float d_0 = 1.0 / 10.0;
+    float d_1 = 6.0 / 10.0;
+    float d_2 = 3.0 / 10.0;
+    float eps = 1e-6;
+
+    float r0 = global_smoothness / (beta_0 + eps);
+    float r1 = global_smoothness / (beta_1 + eps);
+    float r2 = global_smoothness / (beta_2 + eps);
+
+    float alpha_0 = d_0 * (1.0 + r0 * r0);
+    float alpha_1 = d_1 * (1.0 + r1 * r1);
+    float alpha_2 = d_2 * (1.0 + r2 * r2);
+
+    float sum_of_alphas = alpha_0 + alpha_1 + alpha_2;
+
+    float weight_0 = alpha_0 / sum_of_alphas;
+    float weight_1 = alpha_1 / sum_of_alphas;
+    float weight_2 = alpha_2 / sum_of_alphas;
+
+    return candidate_0 * weight_0 + candidate_1 * weight_1 + candidate_2 * weight_2;
+}
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    // vz grid has cells_x columns, cells_y rows, cells_z + 1 layers
+    if (x > cells_x - 1 || y > cells_y - 1 || z > cells_z)
+    {
+        return;
+    }
+
+    uint vz_layer_stride = uint(cells_x) * uint(cells_y);
+    uint vx_layer_stride = uint(cells_x + 1) * uint(cells_y);
+    uint vy_layer_stride = uint(cells_x) * uint(cells_y + 1);
+
+    uint idx = z * vz_layer_stride + y * uint(cells_x) + x;
+    uint stride = uint(cells_x);                     // one vz-grid row (the y direction)
+
+    if (z == 0u || z == uint(cells_z))
+    {
+        MAC_vz_buffer[idx] = 0.0;
+        return;
+    }
+
+    float transported_east;
+    float transported_west;
+    float transported_north;
+    float transported_south;
+    float transported_top;
+    float transported_bottom;
+
+    //                      Z FLUXES  (self advection)
+    // advecting velocity = vz itself, averaged onto the top/bottom faces of the vz CV
+    float vz_bottom_main_grid = (z < cells_z) ? MAC_vz[idx + vz_layer_stride] : 0;
+    float vz_top_main_grid = (z > 0) ? MAC_vz[idx - vz_layer_stride] : 0;
+
+    float vz_bottom_control_volume = 0.5 * (MAC_vz[idx] + vz_bottom_main_grid);
+    float vz_top_control_volume = 0.5 * (MAC_vz[idx] + vz_top_main_grid);
+
+    if (vz_bottom_control_volume > 0.0)
+    {
+        transported_bottom = reconstruct_vz_bottom(idx, x, y, z);
+    }
+    else
+    {
+        transported_bottom = (z < cells_z) ? reconstruct_vz_top(idx + vz_layer_stride, x, y, z + 1u) : reconstruct_vz_top(idx, x, y, z);
+    }
+
+    if (vz_top_control_volume > 0.0)
+    {
+        transported_top = (z > 0) ? reconstruct_vz_bottom(idx - vz_layer_stride, x, y, z - 1u) : reconstruct_vz_bottom(idx, x, y, z);
+    }
+    else
+    {
+        transported_top = reconstruct_vz_top(idx, x, y, z);
+    }
+
+    //fluxes that do not need the opposite axis, so no interpolation needed
+    float flux_top = vz_top_control_volume * transported_top * cell_side_x * cell_side_y;
+    float flux_bottom = vz_bottom_control_volume * transported_bottom * cell_side_x * cell_side_y;
+
+    // ------------------------------------------------------------------------------------
+    // Both cross velocities (vx and vy) are cell centred in z while this vz CV sits ON the
+    // z-face, so both need the SAME pair of z layers averaged (clamped at the z walls).
+    // Everything else lines up exactly.
+    // ------------------------------------------------------------------------------------
+    uint cross_layer0 = (z == 0u) ? 0u : (z - 1u);
+    uint cross_layer1 = (z == uint(cells_z)) ? uint(cells_z - 1) : z;
+
+    //                      X FLUXES
+    //------------------------ EAST / WEST INTERPOLATION ------------------------
+    // x and y line up exactly: the west face is vx column x, the east face is column x+1,
+    // and the vx row is simply y.
+
+    uint vx_layer0_base = cross_layer0 * vx_layer_stride + y * uint(cells_x + 1);
+    uint vx_layer1_base = cross_layer1 * vx_layer_stride + y * uint(cells_x + 1);
+
+    float vx_west = 0.5 * (MAC_vx[vx_layer0_base + x] + MAC_vx[vx_layer1_base + x]);
+    float vx_east = 0.5 * (MAC_vx[vx_layer0_base + x + 1u] + MAC_vx[vx_layer1_base + x + 1u]);
+
+    if (vx_east > 0.0)
+    {
+        transported_east = reconstruct_vx_east(idx, x, y);
+    }
+    else
+    {
+        transported_east = (x < cells_x - 1) ? reconstruct_vx_west(idx + 1, x + 1u, y) : reconstruct_vx_west(idx, x, y);
+    }
+
+    if (vx_west > 0.0)
+    {
+        transported_west = (x > 0) ? reconstruct_vx_east(idx - 1, x - 1u, y) : reconstruct_vx_east(idx, x, y);
+    }
+    else
+    {
+        transported_west = reconstruct_vx_west(idx, x, y);
+    }
+
+    float flux_west = vx_west * transported_west * cell_side_y * cell_side_z;
+    float flux_east = vx_east * transported_east * cell_side_y * cell_side_z;
+
+    //                      Y FLUXES
+    //------------------------ NORTH / SOUTH INTERPOLATION ------------------------
+    // x and y line up exactly: the north face is vy row y, the south face is row y+1,
+    // and the vy column is simply x.
+
+    uint vy_layer0_base = cross_layer0 * vy_layer_stride + x;
+    uint vy_layer1_base = cross_layer1 * vy_layer_stride + x;
+
+    float vy_north = 0.5 * (MAC_vy[vy_layer0_base + y * uint(cells_x)] + MAC_vy[vy_layer1_base + y * uint(cells_x)]);
+    float vy_south = 0.5 * (MAC_vy[vy_layer0_base + (y + 1u) * uint(cells_x)] + MAC_vy[vy_layer1_base + (y + 1u) * uint(cells_x)]);
+
+    if (vy_north > 0.0)
+    {
+        transported_north = (y > 0) ? reconstruct_vy_south(idx - stride, x, y - 1u) : reconstruct_vy_south(idx, x, y);
+    }
+    else
+    {
+        transported_north = reconstruct_vy_north(idx, x, y);
+    }
+
+    if (vy_south > 0.0)
+    {
+        transported_south = reconstruct_vy_south(idx, x, y);
+    }
+    else
+    {
+        transported_south = (y < cells_y - 1) ? reconstruct_vy_north(idx + stride, x, y + 1u) : reconstruct_vy_north(idx, x, y);
+    }
+
+    float flux_north = vy_north * transported_north * cell_side_x * cell_side_z;
+    float flux_south = vy_south * transported_south * cell_side_x * cell_side_z;
+
+    // incoming-positive convention, same as the advect_vx / advect_vy shaders
+    float net_flux = flux_west - flux_south - flux_east + flux_north + flux_top - flux_bottom;
+
+    MAC_vz_buffer[idx] = MAC_vz[idx] + (net_flux * (stable_dt / (cell_side_x * cell_side_y * cell_side_z)));
+}

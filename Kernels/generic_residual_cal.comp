@@ -1,0 +1,180 @@
+#version 430
+
+layout(local_size_x = 8,
+       local_size_y = 8,
+       local_size_z = 8) in;
+
+
+// ============================================================
+// Linear-system coefficients
+// ============================================================
+
+layout(std430, binding = 0)
+buffer aPBuffer
+{
+    float aP[];
+};
+
+layout(std430, binding = 1)
+buffer aWBuffer
+{
+    float aW[];
+};
+
+layout(std430, binding = 2)
+buffer aEBuffer
+{
+    float aE[];
+};
+
+layout(std430, binding = 3)
+buffer aSBuffer
+{
+    float aS[];
+};
+
+layout(std430, binding = 4)
+buffer aNBuffer
+{
+    float aN[];
+};
+
+layout(std430, binding = 5)
+buffer aBBuffer
+{
+    float aB[];
+};
+
+layout(std430, binding = 6)
+buffer aTBuffer
+{
+    float aT[];
+};
+
+
+// ============================================================
+// RHS
+// ============================================================
+
+layout(std430, binding = 7)
+buffer RHSBuffer
+{
+    float rhs[];
+};
+
+
+// ============================================================
+// Current solution
+// ============================================================
+
+layout(std430, binding = 8)
+buffer SolutionBuffer
+{
+    float solution[];
+};
+
+
+// ============================================================
+// Residual
+// ============================================================
+
+layout(std430, binding = 9)
+buffer ResidualBuffer
+{
+    float residual[];
+};
+
+
+// ============================================================
+// Grid dimensions
+// ============================================================
+
+uniform int current_cells_x;
+uniform int current_cells_y;
+uniform int current_cells_z;
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+
+    // --------------------------------------------------------
+    // Bounds check
+    // --------------------------------------------------------
+
+    if (x >= uint(current_cells_x) ||
+        y >= uint(current_cells_y) ||
+        z >= uint(current_cells_z))
+    {
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Linear index
+    // --------------------------------------------------------
+
+    uint layer_stride = uint(current_cells_x) * uint(current_cells_y);
+
+    uint id = z * layer_stride + y * uint(current_cells_x) + x;
+
+
+    // --------------------------------------------------------
+    // Current solution
+    // --------------------------------------------------------
+
+    float center = solution[id];
+
+
+    // --------------------------------------------------------
+    // Neighbor values
+    //
+    // Helios convention:
+    //
+    // -X = W
+    // +X = E
+    // -Y = N
+    // +Y = S
+    // -Z = T
+    // +Z = B
+    // --------------------------------------------------------
+
+    float west = (x > 0u) ? solution[id - 1u] : center;
+
+    float east = (x + 1u < uint(current_cells_x)) ? solution[id + 1u] : center;
+
+    float north = (y > 0u) ? solution[id - uint(current_cells_x)] : center;
+
+    float south = (y + 1u < uint(current_cells_y)) ? solution[id + uint(current_cells_x)] : center;
+
+    float top = (z > 0u) ? solution[id - layer_stride] : center;
+
+    float bottom = (z + 1u < uint(current_cells_z)) ? solution[id + layer_stride] : center;
+
+
+    // --------------------------------------------------------
+    // Calculate A*x
+    //
+    // aP*xP +
+    // aW*xW +
+    // aE*xE +
+    // aS*xS +
+    // aN*xN +
+    // aB*xB +
+    // aT*xT
+    // --------------------------------------------------------
+
+    float Ax = aP[id] * center + aW[id] * west + aE[id] * east + aS[id] * south + aN[id] * north + aB[id] * bottom + aT[id] * top;
+
+
+    // --------------------------------------------------------
+    // Residual
+    //
+    // r = b - A*x
+    // --------------------------------------------------------
+
+    residual[id] = rhs[id] - Ax;
+}

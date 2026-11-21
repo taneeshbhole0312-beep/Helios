@@ -1,0 +1,347 @@
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// ------------------------------------------------------------
+// Inputs: MAC velocity fields
+// VX: (cells_x + 1) * cells_y * cells_z
+// VY: cells_x * (cells_y + 1) * cells_z
+// VZ: cells_x * cells_y * (cells_z + 1)
+// ------------------------------------------------------------
+
+layout(std430, binding = 0) buffer VXBuffer
+{
+    float vx[];
+};
+
+layout(std430, binding = 1) buffer VYBuffer
+{
+    float vy[];
+};
+
+layout(std430, binding = 2) buffer VZBuffer
+{
+    float vz[];
+};
+
+// ------------------------------------------------------------
+// Smoke input/output: cell-centered scalar field
+// smoke_in  : read-only current state
+// smoke_out : write-only next state
+// size = cells_x * cells_y * cells_z
+// ------------------------------------------------------------
+
+layout(std430, binding = 3) buffer SmokeInBuffer
+{
+    float smoke_in[];
+};
+
+layout(std430, binding = 4) buffer SmokeOutBuffer
+{
+    float smoke_out[];
+};
+
+// ------------------------------------------------------------
+// Grid sizes / spacing / timestep
+// ------------------------------------------------------------
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+uniform float dt;
+
+// ------------------------------------------------------------
+// Index helpers
+// ------------------------------------------------------------
+
+int smokeIndex(int x, int y, int z)
+{
+    return z * cells_y * cells_x + y * cells_x + x;
+}
+
+int vxFaceIndex(int fx, int y, int z)
+{
+    // fx in [0, cells_x]
+    return z * cells_y * (cells_x + 1) + y * (cells_x + 1) + fx;
+}
+
+int vyFaceIndex(int x, int fy, int z)
+{
+    // fy in [0, cells_y]
+    return z * (cells_y + 1) * cells_x + fy * cells_x + x;
+}
+
+int vzFaceIndex(int x, int y, int fz)
+{
+    // fz in [0, cells_z]
+    return fz * cells_y * cells_x + y * cells_x + x;
+}
+
+float sampleSmoke(int x, int y, int z)
+{
+    x = clamp(x, 0, cells_x - 1);
+    y = clamp(y, 0, cells_y - 1);
+    z = clamp(z, 0, cells_z - 1);
+    return smoke_in[smokeIndex(x, y, z)];
+}
+
+// ------------------------------------------------------------
+// WENO-Z5 reconstruction helpers
+// These reconstruct the scalar at a face from a 5-point stencil.
+// ------------------------------------------------------------
+
+float weno5_east(float v_m2, float v_m1, float v_0, float v_p1, float v_p2)
+{
+    // Left-biased reconstruction at the EAST face of the cell
+    // (i+1/2) using stencil centered on i.
+
+    float c0 = (1.0 / 3.0) * v_m2 - (7.0 / 6.0) * v_m1 + (11.0 / 6.0) * v_0;
+    float c1 = -(1.0 / 6.0) * v_m1 + (5.0 / 6.0) * v_0 + (1.0 / 3.0) * v_p1;
+    float c2 = (1.0 / 3.0) * v_0 + (5.0 / 6.0) * v_p1 - (1.0 / 6.0) * v_p2;
+
+    float b0_p1 = v_m2 - 2.0 * v_m1 + v_0;
+    float b0_p2 = v_m2 - 4.0 * v_m1 + 3.0 * v_0;
+    float beta0 = (13.0 / 12.0) * b0_p1 * b0_p1 + 0.25 * b0_p2 * b0_p2;
+
+    float b1_p1 = v_m1 - 2.0 * v_0 + v_p1;
+    float b1_p2 = v_m1 - v_p1;
+    float beta1 = (13.0 / 12.0) * b1_p1 * b1_p1 + 0.25 * b1_p2 * b1_p2;
+
+    float b2_p1 = v_0 - 2.0 * v_p1 + v_p2;
+    float b2_p2 = 3.0 * v_0 - 4.0 * v_p1 + v_p2;
+    float beta2 = (13.0 / 12.0) * b2_p1 * b2_p1 + 0.25 * b2_p2 * b2_p2;
+
+    float tau5 = abs(beta0 - beta2);
+
+    float d0 = 1.0 / 10.0;
+    float d1 = 6.0 / 10.0;
+    float d2 = 3.0 / 10.0;
+
+    float eps = 1e-6;
+
+    float a0 = d0 * (1.0 + (tau5 / (beta0 + eps)) * (tau5 / (beta0 + eps)));
+    float a1 = d1 * (1.0 + (tau5 / (beta1 + eps)) * (tau5 / (beta1 + eps)));
+    float a2 = d2 * (1.0 + (tau5 / (beta2 + eps)) * (tau5 / (beta2 + eps)));
+
+    float sumA = a0 + a1 + a2;
+
+    float w0 = a0 / sumA;
+    float w1 = a1 / sumA;
+    float w2 = a2 / sumA;
+
+    return c0 * w0 + c1 * w1 + c2 * w2;
+}
+
+float weno5_west(float v_m2, float v_m1, float v_0, float v_p1, float v_p2)
+{
+    // Right-biased reconstruction at the WEST face of the cell
+    // (i-1/2) using stencil centered on i.
+
+    float c0 = (11.0 / 6.0) * v_0 - (7.0 / 6.0) * v_p1 + (1.0 / 3.0) * v_p2;
+    float c1 = (1.0 / 3.0) * v_m1 + (5.0 / 6.0) * v_0 - (1.0 / 6.0) * v_p1;
+    float c2 = (1.0 / 3.0) * v_0 + (5.0 / 6.0) * v_m1 - (1.0 / 6.0) * v_m2;
+
+    float b0_p1 = v_p2 - 2.0 * v_p1 + v_0;
+    float b0_p2 = v_p2 - 4.0 * v_p1 + 3.0 * v_0;
+    float beta0 = (13.0 / 12.0) * b0_p1 * b0_p1 + 0.25 * b0_p2 * b0_p2;
+
+    float b1_p1 = v_p1 - 2.0 * v_0 + v_m1;
+    float b1_p2 = v_p1 - v_m1;
+    float beta1 = (13.0 / 12.0) * b1_p1 * b1_p1 + 0.25 * b1_p2 * b1_p2;
+
+    float b2_p1 = v_0 - 2.0 * v_m1 + v_m2;
+    float b2_p2 = 3.0 * v_0 - 4.0 * v_m1 + v_m2;
+    float beta2 = (13.0 / 12.0) * b2_p1 * b2_p1 + 0.25 * b2_p2 * b2_p2;
+
+    float tau5 = abs(beta0 - beta2);
+
+    float d0 = 1.0 / 10.0;
+    float d1 = 6.0 / 10.0;
+    float d2 = 3.0 / 10.0;
+
+    float eps = 1e-6;
+
+    float a0 = d0 * (1.0 + (tau5 / (beta0 + eps)) * (tau5 / (beta0 + eps)));
+    float a1 = d1 * (1.0 + (tau5 / (beta1 + eps)) * (tau5 / (beta1 + eps)));
+    float a2 = d2 * (1.0 + (tau5 / (beta2 + eps)) * (tau5 / (beta2 + eps)));
+
+    float sumA = a0 + a1 + a2;
+
+    float w0 = a0 / sumA;
+    float w1 = a1 / sumA;
+    float w2 = a2 / sumA;
+
+    return c0 * w0 + c1 * w1 + c2 * w2;
+}
+
+// ------------------------------------------------------------
+// Face reconstructions for the smoke field
+// ------------------------------------------------------------
+
+float smoke_x_east(int x, int y, int z)
+{
+    return weno5_east(
+        sampleSmoke(x - 2, y, z),
+        sampleSmoke(x - 1, y, z),
+        sampleSmoke(x,     y, z),
+        sampleSmoke(x + 1, y, z),
+        sampleSmoke(x + 2, y, z)
+    );
+}
+
+float smoke_x_west(int x, int y, int z)
+{
+    return weno5_west(
+        sampleSmoke(x - 2, y, z),
+        sampleSmoke(x - 1, y, z),
+        sampleSmoke(x,     y, z),
+        sampleSmoke(x + 1, y, z),
+        sampleSmoke(x + 2, y, z)
+    );
+}
+
+float smoke_y_south(int x, int y, int z)
+{
+    return weno5_east(
+        sampleSmoke(x, y - 2, z),
+        sampleSmoke(x, y - 1, z),
+        sampleSmoke(x, y,     z),
+        sampleSmoke(x, y + 1, z),
+        sampleSmoke(x, y + 2, z)
+    );
+}
+
+float smoke_y_north(int x, int y, int z)
+{
+    return weno5_west(
+        sampleSmoke(x, y - 2, z),
+        sampleSmoke(x, y - 1, z),
+        sampleSmoke(x, y,     z),
+        sampleSmoke(x, y + 1, z),
+        sampleSmoke(x, y + 2, z)
+    );
+}
+
+float smoke_z_bottom(int x, int y, int z)
+{
+    return weno5_east(
+        sampleSmoke(x, y, z - 2),
+        sampleSmoke(x, y, z - 1),
+        sampleSmoke(x, y, z),
+        sampleSmoke(x, y, z + 1),
+        sampleSmoke(x, y, z + 2)
+    );
+}
+
+float smoke_z_top(int x, int y, int z)
+{
+    return weno5_west(
+        sampleSmoke(x, y, z - 2),
+        sampleSmoke(x, y, z - 1),
+        sampleSmoke(x, y, z),
+        sampleSmoke(x, y, z + 1),
+        sampleSmoke(x, y, z + 2)
+    );
+}
+
+// ------------------------------------------------------------
+// Face fluxes with upwinding
+// face index fx/fy/fz is the interface between cells:
+//   x-face: between x-1 and x, so fx in [0, cells_x]
+//   y-face: between y-1 and y, so fy in [0, cells_y]
+//   z-face: between z-1 and z, so fz in [0, cells_z]
+// Boundary faces return zero flux (closed box).
+// ------------------------------------------------------------
+
+float flux_x(int fx, int y, int z)
+{
+    if (fx <= 0 || fx >= cells_x)
+        return 0.0;
+
+    float u = vx[vxFaceIndex(fx, y, z)];
+
+    if (u >= 0.0)
+    {
+        // Upwind from the left cell
+        return u * smoke_x_east(fx - 1, y, z);
+    }
+    else
+    {
+        // Upwind from the right cell
+        return u * smoke_x_west(fx, y, z);
+    }
+}
+
+float flux_y(int x, int fy, int z)
+{
+    if (fy <= 0 || fy >= cells_y)
+        return 0.0;
+
+    float v = vy[vyFaceIndex(x, fy, z)];
+
+    if (v >= 0.0)
+    {
+        return v * smoke_y_south(x, fy - 1, z);
+    }
+    else
+    {
+        return v * smoke_y_north(x, fy, z);
+    }
+}
+
+float flux_z(int x, int y, int fz)
+{
+    if (fz <= 0 || fz >= cells_z)
+        return 0.0;
+
+    float w = vz[vzFaceIndex(x, y, fz)];
+
+    if (w >= 0.0)
+    {
+        return w * smoke_z_bottom(x, y, fz - 1);
+    }
+    else
+    {
+        return w * smoke_z_top(x, y, fz);
+    }
+}
+
+void main()
+{
+    uint ux = gl_GlobalInvocationID.x;
+    uint uy = gl_GlobalInvocationID.y;
+    uint uz = gl_GlobalInvocationID.z;
+
+    if (ux >= uint(cells_x) || uy >= uint(cells_y) || uz >= uint(cells_z))
+        return;
+
+    int x = int(ux);
+    int y = int(uy);
+    int z = int(uz);
+
+    int cidx = smokeIndex(x, y, z);
+    float rho = smoke_in[cidx];
+
+    // Net flux through the 6 faces of this cell
+    float fx_r = flux_x(x + 1, y, z);
+    float fx_l = flux_x(x,     y, z);
+
+    float fy_t = flux_y(x, y + 1, z);
+    float fy_b = flux_y(x, y,     z);
+
+    float fz_f = flux_z(x, y, z + 1);
+    float fz_b = flux_z(x, y, z);
+
+    float div_flux =
+        (fx_r - fx_l) / dx +
+        (fy_t - fy_b) / dy +
+        (fz_f - fz_b) / dz;
+
+    float rho_new = rho - dt * div_flux;
+
+    smoke_out[cidx] = rho_new;
+}

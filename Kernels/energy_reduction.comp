@@ -1,0 +1,122 @@
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;     // DON'T change (the reduction below assumes 512 invocations)
+
+// ============================================================================================================================
+// FIRST PASS OF AN ENERGY SUM OVER THE CELLS (debug / diagnostics)
+//
+// One work group sums one 8 x 8 x 8 block of cells and writes ONE partial sum (at its flat work group index). The later passes of the
+// reduction are the existing residual_sq_summation_L2.comp kernel with squared_input = true (plain sums of partial sums).
+//
+// The sum is KINEMATIC (per unit mass, volume and density are applied on the CPU in double precision):
+//
+//   mode 0 :  MEAN FLOW         e_c = 1/2 ( u_c^2 + v_c^2 + w_c^2 )
+//             The staggered face velocities are interpolated to the CELL CENTROID first:
+//                 u_c = (u[x] + u[x+1]) / 2      v_c = (v[y] + v[y+1]) / 2      w_c = (w[z] + w[z+1]) / 2
+//             (x, y, z are the cell indices; the two faces of a cell have the indices x and x + 1 along their own axis).
+//
+//   mode 1 :  TURBULENT         e_c = k_c        (cell centered k, taken as it is stored)
+// ============================================================================================================================
+
+layout(std430, binding = 0) buffer UVelocity
+{
+    float u[];          // (grid_x + 1) x grid_y x grid_z      (only read in mode 0)
+};
+
+layout(std430, binding = 1) buffer VVelocity
+{
+    float v[];          // grid_x x (grid_y + 1) x grid_z      (only read in mode 0)
+};
+
+layout(std430, binding = 2) buffer WVelocity
+{
+    float w[];          // grid_x x grid_y x (grid_z + 1)      (only read in mode 0)
+};
+
+layout(std430, binding = 3) buffer KField
+{
+    float k[];          // grid_x x grid_y x grid_z            (only read in mode 1)
+};
+
+layout(std430, binding = 4) buffer PartialSums
+{
+    float partial_sums[];       // EXACTLY one element per work group
+};
+
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+uniform int mode;               // 0 = mean flow kinetic energy, 1 = turbulent kinetic energy
+
+shared float wg_sum[512];
+
+
+uint index_u(uint x, uint y, uint z)
+{
+    return z * ((grid_x + 1u) * grid_y) + y * (grid_x + 1u) + x;
+}
+
+uint index_v(uint x, uint y, uint z)
+{
+    return z * (grid_x * (grid_y + 1u)) + y * grid_x + x;
+}
+
+uint index_w(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y) + y * grid_x + x;
+}
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y) + y * grid_x + x;
+}
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    uint l_id = gl_LocalInvocationIndex;
+
+    float element = 0.0;
+
+    if (x < grid_x && y < grid_y && z < grid_z)
+    {
+        if (mode == 0)
+        {
+            // staggered faces -> cell centroid
+            float u_c = 0.5 * (u[index_u(x, y, z)] + u[index_u(x + 1u, y, z)]);
+            float v_c = 0.5 * (v[index_v(x, y, z)] + v[index_v(x, y + 1u, z)]);
+            float w_c = 0.5 * (w[index_w(x, y, z)] + w[index_w(x, y, z + 1u)]);
+
+            element = 0.5 * (u_c * u_c + v_c * v_c + w_c * w_c);
+        }
+        else
+        {
+            element = k[index_cell(x, y, z)];
+        }
+    }
+
+    wg_sum[l_id] = element;
+
+    barrier();
+
+    for (uint stride = 256u; stride > 0u; stride >>= 1u)
+    {
+        if (l_id < stride)
+            wg_sum[l_id] += wg_sum[l_id + stride];
+
+        barrier();
+    }
+
+    if (l_id == 0u)
+    {
+        uint flatGroup = gl_WorkGroupID.z * (gl_NumWorkGroups.x * gl_NumWorkGroups.y)
+                       + gl_WorkGroupID.y * gl_NumWorkGroups.x
+                       + gl_WorkGroupID.x;
+
+        partial_sums[flatGroup] = wg_sum[0];
+    }
+}

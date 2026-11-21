@@ -1,0 +1,212 @@
+//=================================================================================================================================
+//THE REASON WE HAVE THIS SEPARATE KERNEL IS BECAUSE WE DO HARMONIC INTERPOLATION FOR MU EFF IN THIS K ASSEMBLY KERNEL, WHICH IS 
+//FUNDAMENTALLY DIFFERENT THAN THE NORMAL AVERAGE WE DO FOR MOMENTUM EQUATION
+//=================================================================================================================================
+
+//---------------------------------------------------------------------------------------------------------------
+//                          This kernel is ONLY for k-eps model and standard k-omega model
+//---------------------------------------------------------------------------------------------------------------
+
+
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+uniform float dynamic_viscosity;
+
+uniform bool is_eps;     //For k eps model, it differentiates in k and eps
+uniform bool is_omega_model;    //differentiates in k-eps model and k-omega model
+
+layout(std430, binding = 0) buffer AP
+{
+    float aP[];
+};
+
+layout(std430, binding = 1) buffer AW
+{
+    float aW[];
+};
+
+layout(std430, binding = 2) buffer AE
+{
+    float aE[];
+};
+
+layout(std430, binding = 3) buffer AS
+{
+    float aS[];
+};
+
+layout(std430, binding = 4) buffer AN
+{
+    float aN[];
+};
+
+layout(std430, binding = 5) buffer AB
+{
+    float aB[];
+};
+
+layout(std430, binding = 6) buffer AT
+{
+    float aT[];
+};
+
+layout(std430, binding = 7) readonly buffer MuEff
+{
+    float mu_eff[];
+};
+
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+
+float harmonic_mean(float a, float b)
+{
+    return (2.0 * a * b) / (a + b);
+}
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= grid_x || y >= grid_y || z >= grid_z)
+        return;
+
+    // Boundary cells are handled by the wall treatment.
+    if (x == 0u || x == grid_x - 1u ||
+        y == 0u || y == grid_y - 1u ||
+        z == 0u || z == grid_z - 1u)
+        return;
+
+    uint id = index_cell(x, y, z);
+
+    float area_x = dy * dz;
+    float area_y = dx * dz;
+    float area_z = dx * dy;
+    float sigma_k = 1.0;
+    float sigma_eps = 1.3;
+    float sigma_omega_model_common = 0.5;          // This is the sigma_k and sigma_omega for the k-omega model where sigma_k = sigma_omega = 0.5
+
+
+    // Neighbor indices
+    uint id_W = index_cell(x - 1u, y, z);
+    uint id_E = index_cell(x + 1u, y, z);
+
+    uint id_N = index_cell(x, y - 1u, z);
+    uint id_S = index_cell(x, y + 1u, z);
+
+    uint id_T = index_cell(x, y, z - 1u);
+    uint id_B = index_cell(x, y, z + 1u);
+
+    float tao_P;
+    float tao_face_E;
+    float tao_face_W;
+    float tao_face_S;
+    float tao_face_N;
+    float tao_face_B;
+    float tao_face_T;
+
+    // Harmonic face viscosities
+
+    if(is_omega_model)
+    {
+        // In k-omega model sigma_k = sigma_omega = 0.5 in our formulation wilcox 2002
+
+        tao_P = dynamic_viscosity + ((mu_eff[id] - dynamic_viscosity) * sigma_omega_model_common);
+
+        float tao_east_cell = dynamic_viscosity + ((mu_eff[id_E] - dynamic_viscosity) * sigma_omega_model_common);
+        float tao_west_cell = dynamic_viscosity + ((mu_eff[id_W] - dynamic_viscosity) * sigma_omega_model_common);
+        float tao_north_cell = dynamic_viscosity + ((mu_eff[id_N] - dynamic_viscosity) * sigma_omega_model_common);
+        float tao_south_cell = dynamic_viscosity + ((mu_eff[id_S] - dynamic_viscosity) * sigma_omega_model_common);
+        float tao_top_cell = dynamic_viscosity + ((mu_eff[id_T] - dynamic_viscosity) * sigma_omega_model_common);
+        float tao_bottom_cell = dynamic_viscosity + ((mu_eff[id_B] - dynamic_viscosity) * sigma_omega_model_common);
+
+        tao_face_E = harmonic_mean(tao_P, tao_east_cell);
+        tao_face_W = harmonic_mean(tao_P, tao_west_cell);
+        tao_face_N = harmonic_mean(tao_P, tao_north_cell);
+        tao_face_S = harmonic_mean(tao_P, tao_south_cell);
+        tao_face_B = harmonic_mean(tao_P, tao_bottom_cell);
+        tao_face_T = harmonic_mean(tao_P, tao_top_cell);
+    }   
+    else
+    {
+        // In k-eps model the sigma eps and k have different values
+
+        if(!is_eps)
+        {
+            tao_P = mu_eff[id];
+
+            tao_face_E = harmonic_mean(tao_P, mu_eff[id_E]); // we can do this for k because sigma k (which divides k) is equal to 1.0
+            tao_face_W = harmonic_mean(tao_P, mu_eff[id_W]); // we can do this for k because sigma k (which divides k) is equal to 1.0
+
+            tao_face_S = harmonic_mean(tao_P, mu_eff[id_S]); // we can do this for k because sigma k (which divides k) is equal to 1.0
+            tao_face_N = harmonic_mean(tao_P, mu_eff[id_N]); // we can do this for k because sigma k (which divides k) is equal to 1.0
+
+            tao_face_B = harmonic_mean(tao_P, mu_eff[id_B]); // we can do this for k because sigma k (which divides k) is equal to 1.0
+            tao_face_T = harmonic_mean(tao_P, mu_eff[id_T]); // we can do this for k because sigma k (which divides k) is equal to 1.0
+        }
+        else
+        {
+            tao_P = dynamic_viscosity + ((mu_eff[id] - dynamic_viscosity) / sigma_eps);
+
+            float tao_east_cell = dynamic_viscosity + ((mu_eff[id_E] - dynamic_viscosity) / sigma_eps);
+            float tao_west_cell = dynamic_viscosity + ((mu_eff[id_W] - dynamic_viscosity) / sigma_eps);
+            float tao_north_cell = dynamic_viscosity + ((mu_eff[id_N] - dynamic_viscosity) / sigma_eps);
+            float tao_south_cell = dynamic_viscosity + ((mu_eff[id_S] - dynamic_viscosity) / sigma_eps);
+            float tao_top_cell = dynamic_viscosity + ((mu_eff[id_T] - dynamic_viscosity) / sigma_eps);
+            float tao_bottom_cell = dynamic_viscosity + ((mu_eff[id_B] - dynamic_viscosity) / sigma_eps);
+
+            tao_face_E = harmonic_mean(tao_P, tao_east_cell);
+            tao_face_W = harmonic_mean(tao_P, tao_west_cell);
+            tao_face_N = harmonic_mean(tao_P, tao_north_cell);
+            tao_face_S = harmonic_mean(tao_P, tao_south_cell);
+            tao_face_B = harmonic_mean(tao_P, tao_bottom_cell);
+            tao_face_T = harmonic_mean(tao_P, tao_top_cell);
+        }
+    }
+
+    // Diffusion conductances
+    float D_E = tao_face_E * area_x / dx;
+    float D_W = tao_face_W * area_x / dx;
+
+    float D_S = tao_face_S * area_y / dy;
+    float D_N = tao_face_N * area_y / dy;
+
+    float D_B = tao_face_B * area_z / dz;
+    float D_T = tao_face_T * area_z / dz;
+
+    // Diffusion contribution
+    aP[id] += D_E;
+    aE[id] -= D_E;
+
+    aP[id] += D_W;
+    aW[id] -= D_W;
+
+    aP[id] += D_S;
+    aS[id] -= D_S;
+
+    aP[id] += D_N;
+    aN[id] -= D_N;
+
+    aP[id] += D_B;
+    aB[id] -= D_B;
+
+    aP[id] += D_T;
+    aT[id] -= D_T;
+}

@@ -1,0 +1,80 @@
+#version 430 core
+
+layout(local_size_x = 8,
+       local_size_y = 8,
+       local_size_z = 8) in;
+
+layout(std430, binding = 0)
+buffer VyBuffer
+{
+    float vy[];
+};
+
+layout(std430, binding = 1)
+buffer writeonly VyOutBuffer
+{
+    float vy_out[];
+};
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float dynamic_viscosity;
+uniform float density;
+uniform float stable_dt;
+uniform float cell_side_x;
+uniform float cell_side_y;
+uniform float cell_side_z;
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= cells_x || y > cells_y || z >= cells_z)
+        return;
+
+    uint idx = z * (cells_x * (cells_y + 1)) + y * cells_x + x;
+
+    float vy_west =
+        (x > 0)
+        ? vy[idx - 1]
+        : vy[idx];
+
+    float vy_east =
+        (x < cells_x - 1)
+        ? vy[idx + 1]
+        : vy[idx];
+
+    float vy_north =
+        (y > 0)
+        ? vy[idx - cells_x]
+        : vy[idx];
+
+    float vy_south =
+        (y < cells_y)
+        ? vy[idx + cells_x]
+        : vy[idx];
+
+    float vy_top =
+        (z > 0)
+        ? vy[idx - (cells_x * (cells_y + 1))]
+        : vy[idx];
+
+    float vy_down =
+        (z < cells_z - 1)
+        ? vy[idx + (cells_x * (cells_y + 1))]
+        : vy[idx];
+
+    float inv_dx2 = 1.0 / (cell_side_x * cell_side_x);
+    float inv_dy2 = 1.0 / (cell_side_y * cell_side_y);
+    float inv_dz2 = 1.0 / (cell_side_z * cell_side_z);
+
+    float laplacian = (vy_west - 2.0 * vy[idx] + vy_east) * inv_dx2 + (vy_north - 2.0 * vy[idx] + vy_south) * inv_dy2 + (vy_top - 2.0 * vy[idx] + vy_down) * inv_dz2;
+
+    float kinematic_viscosity = dynamic_viscosity / density;
+
+    vy_out[idx] = vy[idx] + kinematic_viscosity * stable_dt * laplacian;
+}

@@ -1,0 +1,114 @@
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(std430, binding = 0) buffer WALL_DISTS
+{
+    float near_wall_dists[];
+};
+
+layout(std430, binding = 1) buffer Omega
+{
+    float omega[];
+};
+
+layout(std430, binding = 2) buffer K
+{
+    float k[];
+};
+
+layout(std430, binding = 3) buffer F1_VALUES_FIELD
+{
+    float blended_coefficient[];
+};
+
+uniform float dynamic_viscosity;
+uniform float density;
+uniform float omega_min;        // same floor as the cross diffusion kernel, so F1 and the source see the same omega
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+const float sigma_omega_2 = 0.856;
+const float beta_star = 0.09;
+
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= grid_x || y >= grid_y || z >= grid_z)
+        return;
+
+    // Boundary cells are handled by the wall treatment.
+    if (x == 0u || x == grid_x - 1u ||
+        y == 0u || y == grid_y - 1u ||
+        z == 0u || z == grid_z - 1u)
+        return;
+
+
+    uint index = index_cell(x, y, z);
+
+    uint stride_x = 1;
+    uint stride_y = grid_x;
+    uint stride_z = grid_x * grid_y;
+
+    vec3 grad_k;
+    vec3 grad_omega;
+
+    // X derivatives
+    grad_k.x = (k[index + stride_x] -
+                k[index - stride_x]) / (2.0 * dx);
+
+    grad_omega.x = (omega[index + stride_x] -
+                    omega[index - stride_x]) / (2.0 * dx);
+
+    // Y derivatives
+    grad_k.y = (k[index + stride_y] -
+                k[index - stride_y]) / (2.0 * dy);
+
+    grad_omega.y = (omega[index + stride_y] -
+                    omega[index - stride_y]) / (2.0 * dy);
+
+    // Z derivatives
+    grad_k.z = (k[index + stride_z] -
+                k[index - stride_z]) / (2.0 * dz);
+
+    grad_omega.z = (omega[index + stride_z] -
+                    omega[index - stride_z]) / (2.0 * dz);
+
+    
+    float dot_grad_k_grad_omega = (grad_k.x * grad_omega.x) + (grad_k.y * grad_omega.y) + (grad_k.z * grad_omega.z);
+
+    float wall_dist = max(near_wall_dists[index], 1e-12);
+
+    // omega floor used in every division below (single floor, see assemble_cross_diffusion_term_contribution_for_SST.comp)
+    float omega_value = max(omega[index], max(omega_min, 1e-12));
+
+    float k_value = max(k[index], 0.0);
+    float nu = dynamic_viscosity / max(density, 1e-12);
+    float arg1_inner = max((sqrt(k_value) / (beta_star * omega_value * wall_dist)),
+                           ((500.0 * nu) / (wall_dist * wall_dist * omega_value)));
+    
+
+    float CD_k_omega = max((2.0 * density * sigma_omega_2 * (1.0 / omega_value) * dot_grad_k_grad_omega), 1e-10);
+    float arg1s_arg_2 = ((4.0 * density * sigma_omega_2 * k_value) / (CD_k_omega * wall_dist * wall_dist));
+
+    float arg_1 = min(arg1_inner, arg1s_arg_2);
+
+    float F1 = tanh(min(pow(arg_1, 4.0), 20.0));    //tanh(20) = 1 - 4.25 * (10 power - 18)       So a numerical protection
+
+    blended_coefficient[index] = F1;
+}

@@ -1,0 +1,128 @@
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(std430, binding = 0) readonly buffer VXBuffer
+{
+    float vx[];
+};
+
+layout(std430, binding = 1) readonly buffer VYBuffer
+{
+    float vy[];
+};
+
+layout(std430, binding = 2) readonly buffer VZBuffer
+{
+    float vz[];
+};
+
+layout(std430, binding = 3) writeonly buffer VorticityBuffer
+{
+    vec4 vorticity[];
+};
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+
+uint vx_index(int x, int y, int z)
+{
+    return uint(
+        z * ((cells_x + 1) * cells_y)
+        + y * (cells_x + 1)
+        + x
+    );
+}
+
+uint vy_index(int x, int y, int z)
+{
+    return uint(
+        z * (cells_x * (cells_y + 1))
+        + y * cells_x
+        + x
+    );
+}
+
+uint vz_index(int x, int y, int z)
+{
+    return uint(
+        z * (cells_x * cells_y)
+        + y * cells_x
+        + x
+    );
+}
+
+
+void main()
+{
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+    uint gz = gl_GlobalInvocationID.z;
+
+    if (gx >= uint(cells_x) ||
+        gy >= uint(cells_y) ||
+        gz >= uint(cells_z))
+        return;
+
+    int x = int(gx);
+    int y = int(gy);
+    int z = int(gz);
+
+    // Forward differences everywhere, EXCEPT at the max-index boundary of the
+    // differencing axis, where the "+1" neighbor would fall outside that
+    // field's valid range (vz has only cells_y rows, vy only cells_z layers,
+    // etc.) and silently alias into unrelated memory. There we fall back to a
+    // backward difference using valid in-range data instead. The min-index
+    // boundary (x/y/z == 0) never needs a guard since forward differences
+    // never look behind it.
+
+    float dw_dy = (y < cells_y - 1)
+        ? (vz[vz_index(x, y + 1, z)] - vz[vz_index(x, y,     z)]) / dy
+        : (vz[vz_index(x, y,     z)] - vz[vz_index(x, y - 1, z)]) / dy;
+
+    float dv_dz = (z < cells_z - 1)
+        ? (vy[vy_index(x, y, z + 1)] - vy[vy_index(x, y, z)])     / dz
+        : (vy[vy_index(x, y, z)]     - vy[vy_index(x, y, z - 1)]) / dz;
+
+    float du_dz = (z < cells_z - 1)
+        ? (vx[vx_index(x, y, z + 1)] - vx[vx_index(x, y, z)])     / dz
+        : (vx[vx_index(x, y, z)]     - vx[vx_index(x, y, z - 1)]) / dz;
+
+    float dw_dx = (x < cells_x - 1)
+        ? (vz[vz_index(x + 1, y, z)] - vz[vz_index(x, y, z)])     / dx
+        : (vz[vz_index(x, y, z)]     - vz[vz_index(x - 1, y, z)]) / dx;
+
+    float dv_dx = (x < cells_x - 1)
+        ? (vy[vy_index(x + 1, y, z)] - vy[vy_index(x, y, z)])     / dx
+        : (vy[vy_index(x, y, z)]     - vy[vy_index(x - 1, y, z)]) / dx;
+
+    float du_dy = (y < cells_y - 1)
+        ? (vx[vx_index(x, y + 1, z)] - vx[vx_index(x, y, z)])     / dy
+        : (vx[vx_index(x, y, z)]     - vx[vx_index(x, y - 1, z)]) / dy;
+
+    vec3 omega;
+
+    omega.x = dw_dy - dv_dz;
+    omega.y = du_dz - dw_dx;
+    omega.z = dv_dx - du_dy;
+
+    uint index =
+        uint(
+            z * cells_y * cells_x
+            + y * cells_x
+            + x
+        );
+
+    vorticity[index] = vec4(
+        omega,
+        length(omega)
+    );
+
+    // vorticity[index] = length(omega);
+}

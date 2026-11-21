@@ -1,0 +1,80 @@
+#version 430 core
+
+layout(local_size_x = 8,
+       local_size_y = 8,
+       local_size_z = 8) in;
+
+layout(std430, binding = 0) 
+buffer solutionBuffer
+{
+    float solution[];           // both buffer 0 and 1 are of equal size
+};
+
+layout(std430, binding = 1)
+buffer RHSBuffer
+{
+    float RHS[];           // both buffer 0 and 1 are of equal size
+};
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float cell_side_x;
+uniform float cell_side_y;
+uniform float cell_side_z;
+uniform float stable_dt;
+uniform float density;
+
+uniform int color;
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= cells_x || y >= cells_y || z >= cells_z)
+        return;
+
+    if (((x + y + z) & 1u) != uint(color))
+    {
+        return;
+    }
+
+    uint layer_stride = cells_x * cells_y;
+
+    uint idx = z * layer_stride + y * (cells_x) + x;
+
+    float center = solution[idx];
+
+    float p_west = (x > 0u) ? solution[idx - 1] : center;
+
+    float p_east = (x < uint(cells_x - 1)) ? solution[idx + 1] : center;
+
+    float p_north = (y > 0u) ? solution[idx - uint(cells_x)] : center;
+
+    float p_south = (y < uint(cells_y - 1)) ? solution[idx + uint(cells_x)] : center;
+
+    float p_top = (z > 0u) ? solution[idx - layer_stride] : center; 
+
+    float p_bottom = (z < (cells_z - 1)) ? solution[idx + layer_stride] : center; 
+
+    float dx2 = cell_side_x * cell_side_x;
+    float dy2 = cell_side_y * cell_side_y;
+    float dz2 = cell_side_z * cell_side_z;
+
+    float inv_dx2 = 1.0 / dx2;
+    float inv_dy2 = 1.0 / dy2;
+    float inv_dz2 = 1.0 / dz2;
+
+    // Keep your current RHS convention.
+    // (Only change this if you later decide to change the formulation.)
+    float rhs = (density * RHS[idx]) / stable_dt;
+
+    float numerator = (p_west + p_east) * inv_dx2 + (p_north + p_south) * inv_dy2 + (p_top + p_bottom) * inv_dz2 - rhs;
+
+    float denominator = 2.0 * inv_dx2 + 2.0 * inv_dy2 + 2.0 * inv_dz2;
+
+    solution[idx] = numerator / denominator;
+}

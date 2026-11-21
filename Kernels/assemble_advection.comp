@@ -1,0 +1,1028 @@
+#version 430 core
+
+layout(local_size_x = 8,
+       local_size_y = 8,
+       local_size_z = 8) in;
+
+
+// ============================================================
+// ADVECTION COEFFICIENTS
+//
+// 0 = aP
+// 1 = aW
+// 2 = aE
+// 3 = aS
+// 4 = aN
+// 5 = aB
+// 6 = aT
+// ============================================================
+
+layout(std430, binding = 0) buffer APBuffer
+{
+    float aP[];
+};
+
+layout(std430, binding = 1) buffer AWBuffer
+{
+    float aW[];
+};
+
+layout(std430, binding = 2) buffer AEBuffer
+{
+    float aE[];
+};
+
+layout(std430, binding = 3) buffer ASBuffer
+{
+    float aS[];
+};
+
+layout(std430, binding = 4) buffer ANBuffer
+{
+    float aN[];
+};
+
+layout(std430, binding = 5) buffer ABBuffer
+{
+    float aB[];
+};
+
+layout(std430, binding = 6) buffer ATBuffer
+{
+    float aT[];
+};
+
+
+// ============================================================
+// STAGGERED VELOCITY FIELDS
+//
+// u : XFACE
+//     (cells_x + 1) x cells_y x cells_z
+//
+// v : YFACE
+//     cells_x x (cells_y + 1) x cells_z
+//
+// w : ZFACE
+//     cells_x x cells_y x (cells_z + 1)
+// ============================================================
+
+layout(std430, binding = 7) buffer UBuffer
+{
+    float u[];
+};
+
+layout(std430, binding = 8) buffer VBuffer
+{
+    float v[];
+};
+
+layout(std430, binding = 9) buffer WBuffer
+{
+    float w[];
+};
+
+layout(std430, binding = 10) buffer PhiBuffer             // Only attached if Higher order spatial discreatization is selected
+{
+    float phi[];
+};
+
+layout(std430, binding = 11) buffer RHSPhiBuffer             // Only attached if Higher order spatial discreatization is selected
+{
+    float RHS_phi[];
+};
+
+
+// ============================================================
+// GRID
+// ============================================================
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+uniform float density;
+
+
+// ============================================================
+// TOPOLOGY
+// 0 = CELL CENTERED equation
+// 1 = XFACE / u equation
+// 2 = YFACE / v equation
+// 3 = ZFACE / w equation
+// ============================================================
+
+uniform int topology;               // enum int
+
+uniform int ConvectionScheme;       // enum int
+uniform int FluxLimiter;           // enum int: 0 NONE (unlimited Fromm), 1 MINMOD, 2 VAN_LEER, 3 SUPERBEE
+
+
+// ============================================================
+// INDEX FUNCTIONS
+// ============================================================
+
+uint uIndex(uint x, uint y, uint z)
+{
+    uint nx = uint(cells_x + 1);
+
+    return z * (nx * uint(cells_y))
+         + y * nx
+         + x;
+}
+
+
+uint vIndex(uint x, uint y, uint z)
+{
+    uint ny = uint(cells_y + 1);
+
+    return z * (uint(cells_x) * ny)
+         + y * uint(cells_x)
+         + x;
+}
+
+
+uint wIndex(uint x, uint y, uint z)
+{
+    return z * (uint(cells_x) * uint(cells_y))
+         + y * uint(cells_x)
+         + x;
+}
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (uint(cells_x) * uint(cells_y))
+         + y * uint(cells_x)
+         + x;
+}
+
+
+// ============================================================
+// WALL TREATMENT (no-slip, stationary walls)
+//
+// The six domain walls sit at x = 0, x = cells_x,
+// y = 0, y = cells_y, z = 0, z = cells_z.
+//
+// Two distinct situations arise on a staggered grid:
+//
+// 1. WALL-NORMAL DOF
+//    A velocity component whose own node lies exactly ON a
+//    wall plane (u at x = 0 / cells_x, v at y = 0 / cells_y,
+//    w at z = 0 / cells_z).
+//
+//    No-penetration makes this a KNOWN value (zero), so no
+//    momentum equation is assembled for it: this kernel
+//    returns early and contributes nothing. The transient
+//    kernel supplies the lone diagonal entry, which together
+//    with an all-zero row and an all-zero RHS pins the DOF
+//    to exactly zero.
+//
+// 2. CV FACE LYING ON A WALL
+//    An interior DOF whose control volume has one face on a
+//    wall plane. The velocity normal to that face is zero
+//    there, so the convective mass flux through it vanishes.
+//    That face simply contributes nothing to the stencil.
+//
+//    Note this is exactly what discrete continuity already
+//    implies, so zeroing these fluxes keeps
+//    sum(F_f) = 0 and therefore preserves the diagonal
+//    dominance of the upwind operator.
+// ============================================================
+
+
+// ============================================================
+// SECOND ORDER DEFERRED CONVECTION (cell-centered and all staggered topologies)
+//
+// The matrix assembled below is ALWAYS first-order upwind. When ConvectionScheme == 1 the kernel
+// additionally subtracts, from the RHS of the row, the deferred correction of every face:
+//
+//      dF_f = F_f * ( phi_f^HO - phi_U ),      F_f = outward mass flux (positive = leaving the CV)
+//
+// phi_U is the upwind node of the face, phi_D the downwind node and phi_UU the node behind phi_U.
+// The reconstruction is the limited (TVD) linear-upwind form
+//
+//      phi_f^HO - phi_U = 1/2 psi(r) (phi_D - phi_U),      r = (phi_U - phi_UU) / (phi_D - phi_U)
+//
+// which for NONE (psi = (1 + r) / 2) is exactly Fromm: central gradient at U times half a cell.
+// The limiters are evaluated in a product form (no division by phi_D - phi_U).
+//
+// A face is corrected only when all three nodes UU, U, D exist along the grid line of the face. Anything else (inflow from
+// a pinned wall-treatment cell or from a Dirichlet wall-normal node, i.e. no phi_UU; outflow of a wall-adjacent staggered row
+// towards the wall, again no phi_UU) stays first-order. Both cells that share a solved/solved face evaluate the SAME
+// (UU, U, D) triple with opposite F, so the correction is exactly antisymmetric: the scalar stays conservative between solved
+// cells. Nothing is ever written into a neighbouring row.
+// ============================================================
+
+float limited_increment(float phi_UU, float phi_U, float phi_D)
+{
+    float dU = phi_U - phi_UU;        // difference on the upwind side
+    float dD = phi_D - phi_U;         // difference on the downwind side
+
+    if (FluxLimiter == 0)             // NONE: unlimited Fromm
+        return 0.25 * (dU + dD);
+
+    float a = abs(dU);
+    float b = abs(dD);
+
+    // opposite signs (local extremum) or a flat side: every TVD limiter gives psi = 0, i.e. first order
+    if (dU * dD <= 0.0)
+        return 0.0;
+
+    float sgn = (dD > 0.0) ? 1.0 : -1.0;
+
+    if (FluxLimiter == 1)             // MINMOD:    psi = max(0, min(1, r))
+        return 0.5 * sgn * min(a, b);
+
+    if (FluxLimiter == 2)             // VAN LEER:  psi = (r + |r|) / (1 + |r|)   ->   psi * dD / 2 = sgn a b / (a + b)
+        return sgn * (a * b) / (a + b);
+
+    // SUPERBEE:  psi = max(0, min(2r, 1), min(r, 2))
+    return 0.5 * sgn * max(min(2.0 * a, b), min(a, 2.0 * b));
+}
+
+// Deferred correction of ONE face of the node `id`.
+//   F      outward mass flux through the face
+//   a, n   index of the node and number of nodes along the face normal axis
+//   s      +1 if the neighbour across the face has the larger index along that axis, -1 otherwise
+//   stride linear-index distance between two neighbouring nodes along that axis
+float face_correction(float F, uint id, uint a, uint n, int s, uint stride)
+{
+    if (ConvectionScheme != 1 || F == 0.0)
+        return 0.0;
+
+    int ia   = int(a);
+    int in_  = int(n);
+    int iid  = int(id);
+    int kadam = s * int(stride);
+
+    if (F > 0.0)
+    {
+        // outflow: U = node, D = neighbour, UU = the node behind
+        if (ia - s < 0 || ia - s >= in_ || ia + s < 0 || ia + s >= in_)
+            return 0.0;
+
+        return F * limited_increment(phi[iid - kadam], phi[iid], phi[iid + kadam]);
+    }
+
+    // inflow: U = neighbour, D = node, UU = the node behind the neighbour
+    if (ia + s < 0 || ia + s >= in_ || ia + 2 * s < 0 || ia + 2 * s >= in_)
+        return 0.0;
+
+    return F * limited_increment(phi[iid + 2 * kadam], phi[iid + kadam], phi[iid]);
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+
+    //=======================================================
+    //=======================================================
+    //CELL CENTERED / ANY CELL CENTERED EQUATION
+    //=======================================================
+    //=======================================================
+    if (topology == 0)
+    {
+        if (x >= cells_x || y >= cells_y || z >= cells_z)
+            return;
+
+        // Boundary cells are handled by the wall treatment.
+        //these are like the cell centered quantities like k eps and omega
+        if (x == 0u || x == cells_x - 1u ||
+            y == 0u || y == cells_y - 1u ||
+            z == 0u || z == cells_z - 1u)
+            return;
+
+
+
+        uint id = index_cell(x, y, z);
+
+        float area_x = dy * dz;
+        float area_y = dx * dz;
+        float area_z = dx * dy;
+
+        // Face velocities
+        float u_E = u[uIndex(x + 1u, y, z)];
+        float u_W = u[uIndex(x,       y, z)];
+
+        float v_S = v[vIndex(x, y + 1u, z)];
+        float v_N = v[vIndex(x, y,       z)];
+
+        float w_B = w[wIndex(x, y, z + 1u)];
+        float w_T = w[wIndex(x, y, z)];
+
+        // Signed mass fluxes
+        float F_E = density * u_E * area_x;
+        float F_W = -density * u_W * area_x;
+
+        float F_S = density * v_S * area_y;
+        float F_N = -density * v_N * area_y;
+
+        float F_B = density * w_B * area_z;
+        float F_T = -density * w_T * area_z;
+
+        // East
+        aP[id] += max(F_E, 0.0);
+        aE[id] += min(F_E, 0.0);
+
+        // West
+        aP[id] += max(F_W, 0.0);
+        aW[id] += min(F_W, 0.0);
+
+        // South
+        aP[id] += max(F_S, 0.0);
+        aS[id] += min(F_S, 0.0);
+
+        // North
+        aP[id] += max(F_N, 0.0);
+        aN[id] += min(F_N, 0.0);
+
+        // Bottom
+        aP[id] += max(F_B, 0.0);
+        aB[id] += min(F_B, 0.0);
+
+        // Top
+        aP[id] += max(F_T, 0.0);
+        aT[id] += min(F_T, 0.0);
+        
+        // SECOND ORDER DEFERRED CORRECTION (RHS only, matrix stays first-order upwind). Faces whose stencil would need a node beyond
+        // the pinned wall-treatment layer stay first-order, see face_correction.
+        if (ConvectionScheme == 1)
+        {
+            uint nx = uint(cells_x);
+            uint ny = uint(cells_y);
+            uint nz = uint(cells_z);
+
+            RHS_phi[id] -=
+                  face_correction(F_E, id, x, nx, +1, 1u)
+                + face_correction(F_W, id, x, nx, -1, 1u)
+                + face_correction(F_S, id, y, ny, +1, nx)
+                + face_correction(F_N, id, y, ny, -1, nx)
+                + face_correction(F_B, id, z, nz, +1, nx * ny)
+                + face_correction(F_T, id, z, nz, -1, nx * ny);
+        }
+
+    }
+
+    // ========================================================
+    // ========================================================
+    // XFACE / U EQUATION
+    // ========================================================
+    // ========================================================
+
+    if (topology == 1)
+    {
+        // ----------------------------------------------------
+        // u-field dimensions
+        // ----------------------------------------------------
+
+        uint field_x = uint(cells_x + 1);
+        uint field_y = uint(cells_y);
+        uint field_z = uint(cells_z);
+
+        if (x >= field_x || y >= field_y || z >= field_z)
+        {
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // Wall-normal DOF: u at x = 0 and x = cells_x lies ON
+        // the west / east wall. Dirichlet, not assembled here.
+        // ----------------------------------------------------
+
+        if (x == 0u || x == uint(cells_x))
+        {
+            return;
+        }
+
+
+        uint id = z * (field_x * field_y) + y * field_x + x;
+
+
+        // ====================================================
+        // FACE AREAS
+        // ====================================================
+
+        float area_x = dy * dz;
+        float area_y = dx * dz;
+        float area_z = dx * dy;
+
+
+        // ====================================================
+        // U-CV GEOMETRY
+        //
+        // u_P:
+        //
+        // (x, y+1/2, z+1/2)
+        //
+        // E:
+        // (x+1/2, y+1/2, z+1/2)
+        //
+        // W:
+        // (x-1/2, y+1/2, z+1/2)
+        //
+        // N:
+        // (x, y, z+1/2)
+        //
+        // S:
+        // (x, y+1, z+1/2)
+        //
+        // T:
+        // (x, y+1/2, z)
+        //
+        // B:
+        // (x, y+1/2, z+1)
+        // ====================================================
+
+
+        // ====================================================
+        // EAST / WEST NORMAL VELOCITY
+        //
+        // u is offset by +/- 1/2 in x from the CV faces.
+        //
+        // Therefore interpolate u in x.
+        //
+        // The E/W faces sit at x +/- 1/2, which are pressure
+        // cell centres: always interior for 1 <= x <= cells_x-1.
+        // ====================================================
+
+        float u_W =
+            0.5 * (
+                u[uIndex(x - 1u, y, z)] +
+                u[uIndex(x,      y, z)]
+            );
+
+        float u_E =
+            0.5 * (
+                u[uIndex(x + 1u, y, z)] +
+                u[uIndex(x,      y, z)]
+            );
+
+
+        // ====================================================
+        // NORTH / SOUTH NORMAL VELOCITY
+        //
+        // v is located at:
+        //
+        // (x+1/2, y, z+1/2)
+        //
+        // while the u-CV north/south faces are at:
+        //
+        // (x, y, z+1/2)
+        //
+        // Therefore interpolate v in x.
+        //
+        // The N face lies at y and the S face at y+1, so the
+        // N face is on the y = 0 wall when y == 0, and the
+        // S face is on the y = cells_y wall when
+        // y == cells_y - 1. v vanishes on both.
+        // ====================================================
+
+        float v_N =
+            (y == 0u)
+            ? 0.0
+            : 0.5 * (
+                v[vIndex(x - 1u, y, z)] +
+                v[vIndex(x,      y, z)]
+              );
+
+        float v_S =
+            (y == uint(cells_y - 1))
+            ? 0.0
+            : 0.5 * (
+                v[vIndex(x - 1u, y + 1u, z)] +
+                v[vIndex(x,      y + 1u, z)]
+              );
+
+
+        // ====================================================
+        // TOP / BOTTOM NORMAL VELOCITY
+        //
+        // w is located at:
+        //
+        // (x+1/2, y+1/2, z)
+        //
+        // while the u-CV top/bottom faces are at:
+        //
+        // (x, y+1/2, z)
+        //
+        // Therefore interpolate w in x.
+        //
+        // T face at z, B face at z+1: same wall logic as N/S.
+        // ====================================================
+
+        float w_T =
+            (z == 0u)
+            ? 0.0
+            : 0.5 * (
+                w[wIndex(x - 1u, y, z)] +
+                w[wIndex(x,      y, z)]
+              );
+
+        float w_B =
+            (z == uint(cells_z - 1))
+            ? 0.0
+            : 0.5 * (
+                w[wIndex(x - 1u, y, z + 1u)] +
+                w[wIndex(x,      y, z + 1u)]
+              );
+
+
+        // ====================================================
+        // SIGNED MASS FLUXES
+        //
+        // +X = E
+        // +Y = S
+        // +Z = B
+        // ====================================================
+
+        float F_E =  density * u_E * area_x;
+        float F_W = -density * u_W * area_x;
+
+        float F_S =  density * v_S * area_y;
+        float F_N = -density * v_N * area_y;
+
+        float F_B =  density * w_B * area_z;
+        float F_T = -density * w_T * area_z;
+
+
+        // ====================================================
+        // UPWIND COEFFICIENTS
+        // ====================================================
+
+        aP[id] +=
+              max(F_E, 0.0)
+            + max(F_W, 0.0)
+            + max(F_S, 0.0)
+            + max(F_N, 0.0)
+            + max(F_B, 0.0)
+            + max(F_T, 0.0);
+
+        aE[id] += min(F_E, 0.0);
+        aW[id] += min(F_W, 0.0);
+
+        aS[id] += min(F_S, 0.0);
+        aN[id] += min(F_N, 0.0);
+
+        aB[id] += min(F_B, 0.0);
+        aT[id] += min(F_T, 0.0);
+
+        // SECOND ORDER DEFERRED CORRECTION (RHS only, matrix stays first-order upwind). Faces whose stencil leaves the field
+        // (a wall-adjacent row sending flow AWAY from the wall, inflow into a row from the wall-adjacent row, inflow from a Dirichlet wall-normal node: each would need a node beyond the field) stay first-order; outflow TOWARDS the wall is corrected, the wall-side node being a legitimate downstream node, see face_correction.
+        if (ConvectionScheme == 1)
+        {
+            RHS_phi[id] -=
+                  face_correction(F_E, id, x, field_x, +1, 1u)
+                + face_correction(F_W, id, x, field_x, -1, 1u)
+                + face_correction(F_S, id, y, field_y, +1, field_x)
+                + face_correction(F_N, id, y, field_y, -1, field_x)
+                + face_correction(F_B, id, z, field_z, +1, field_x * field_y)
+                + face_correction(F_T, id, z, field_z, -1, field_x * field_y);
+        }
+    }
+
+
+    // ========================================================
+    // ========================================================
+    // YFACE / V EQUATION
+    // ========================================================
+    // ========================================================
+
+    else if (topology == 2)
+    {
+        // ----------------------------------------------------
+        // v-field dimensions
+        // ----------------------------------------------------
+
+        uint field_x = uint(cells_x);
+        uint field_y = uint(cells_y + 1);
+        uint field_z = uint(cells_z);
+
+        if (x >= field_x ||
+            y >= field_y ||
+            z >= field_z)
+        {
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // Wall-normal DOF: v at y = 0 and y = cells_y lies ON
+        // the north / south wall. Dirichlet, not assembled here.
+        // ----------------------------------------------------
+
+        if (y == 0u ||
+            y == uint(cells_y))
+        {
+            return;
+        }
+
+
+        uint id =
+            z * (field_x * field_y)
+            + y * field_x
+            + x;
+
+
+        // ====================================================
+        // FACE AREAS
+        // ====================================================
+
+        float area_x = dy * dz;
+        float area_y = dx * dz;
+        float area_z = dx * dy;
+
+
+        // ====================================================
+        // V-CV GEOMETRY
+        //
+        // v_P:
+        //
+        // (x+1/2, y, z+1/2)
+        //
+        // E:
+        // (x+1, y, z+1/2)
+        //
+        // W:
+        // (x, y, z+1/2)
+        //
+        // N:
+        // (x+1/2, y-1/2, z+1/2)
+        //
+        // S:
+        // (x+1/2, y+1/2, z+1/2)
+        //
+        // T:
+        // (x+1/2, y, z)
+        //
+        // B:
+        // (x+1/2, y, z+1)
+        // ====================================================
+
+
+        // ====================================================
+        // NORTH / SOUTH NORMAL VELOCITY
+        //
+        // v itself is centered on the v-CV.
+        //
+        // Therefore interpolate v in y to the CV face.
+        //
+        // The N/S faces sit at y -/+ 1/2, which are pressure
+        // cell centres: always interior for 1 <= y <= cells_y-1.
+        // ====================================================
+
+        float v_N =
+            0.5 * (
+                v[vIndex(x, y - 1u, z)] +
+                v[vIndex(x, y,      z)]
+            );
+
+        float v_S =
+            0.5 * (
+                v[vIndex(x, y,      z)] +
+                v[vIndex(x, y + 1u, z)]
+            );
+
+
+        // ====================================================
+        // EAST / WEST NORMAL VELOCITY
+        //
+        // u is located at:
+        //
+        // (x+1/2, y+1/2, z+1/2)
+        //
+        // while E/W faces are at integer y.
+        //
+        // Therefore interpolate u in y.
+        //
+        // The W face lies at x and the E face at x+1, so the
+        // W face is on the x = 0 wall when x == 0, and the
+        // E face is on the x = cells_x wall when
+        // x == cells_x - 1. u vanishes on both.
+        // ====================================================
+
+        float u_W =
+            (x == 0u)
+            ? 0.0
+            : 0.5 * (
+                u[uIndex(x, y - 1u, z)] +
+                u[uIndex(x, y,      z)]
+              );
+
+        float u_E =
+            (x == uint(cells_x - 1))
+            ? 0.0
+            : 0.5 * (
+                u[uIndex(x + 1u, y - 1u, z)] +
+                u[uIndex(x + 1u, y,      z)]
+              );
+
+
+        // ====================================================
+        // TOP / BOTTOM NORMAL VELOCITY
+        //
+        // w is located at:
+        //
+        // (x+1/2, y+1/2, z)
+        //
+        // while T/B faces are at:
+        //
+        // (x+1/2, y, z)
+        //
+        // Therefore interpolate w in y.
+        //
+        // T face at z, B face at z+1.
+        // ====================================================
+
+        float w_T =
+            (z == 0u)
+            ? 0.0
+            : 0.5 * (
+                w[wIndex(x, y - 1u, z)] +
+                w[wIndex(x, y,      z)]
+              );
+
+        float w_B =
+            (z == uint(cells_z - 1))
+            ? 0.0
+            : 0.5 * (
+                w[wIndex(x, y - 1u, z + 1u)] +
+                w[wIndex(x, y,      z + 1u)]
+              );
+
+
+        // ====================================================
+        // SIGNED MASS FLUXES
+        // ====================================================
+
+        float F_E =  density * u_E * area_x;
+        float F_W = -density * u_W * area_x;
+
+        float F_S =  density * v_S * area_y;
+        float F_N = -density * v_N * area_y;
+
+        float F_B =  density * w_B * area_z;
+        float F_T = -density * w_T * area_z;
+
+
+        // ====================================================
+        // UPWIND COEFFICIENTS
+        // ====================================================
+
+        aP[id] +=
+              max(F_E, 0.0)
+            + max(F_W, 0.0)
+            + max(F_S, 0.0)
+            + max(F_N, 0.0)
+            + max(F_B, 0.0)
+            + max(F_T, 0.0);
+
+        aE[id] += min(F_E, 0.0);
+        aW[id] += min(F_W, 0.0);
+
+        aS[id] += min(F_S, 0.0);
+        aN[id] += min(F_N, 0.0);
+
+        aB[id] += min(F_B, 0.0);
+        aT[id] += min(F_T, 0.0);
+
+        // SECOND ORDER DEFERRED CORRECTION (RHS only, matrix stays first-order upwind). Faces whose stencil leaves the field
+        // (a wall-adjacent row sending flow AWAY from the wall, inflow into a row from the wall-adjacent row, inflow from a Dirichlet wall-normal node: each would need a node beyond the field) stay first-order; outflow TOWARDS the wall is corrected, the wall-side node being a legitimate downstream node, see face_correction.
+        if (ConvectionScheme == 1)
+        {
+            RHS_phi[id] -=
+                  face_correction(F_E, id, x, field_x, +1, 1u)
+                + face_correction(F_W, id, x, field_x, -1, 1u)
+                + face_correction(F_S, id, y, field_y, +1, field_x)
+                + face_correction(F_N, id, y, field_y, -1, field_x)
+                + face_correction(F_B, id, z, field_z, +1, field_x * field_y)
+                + face_correction(F_T, id, z, field_z, -1, field_x * field_y);
+        }
+    }
+
+
+    // ========================================================
+    // ========================================================
+    // ZFACE / W EQUATION
+    // ========================================================
+    // ========================================================
+
+    else if (topology == 3)
+    {
+        // ----------------------------------------------------
+        // w-field dimensions
+        // ----------------------------------------------------
+
+        uint field_x = uint(cells_x);
+        uint field_y = uint(cells_y);
+        uint field_z = uint(cells_z + 1);
+
+        if (x >= field_x ||
+            y >= field_y ||
+            z >= field_z)
+        {
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // Wall-normal DOF: w at z = 0 and z = cells_z lies ON
+        // the top / bottom wall. Dirichlet, not assembled here.
+        // ----------------------------------------------------
+
+        if (z == 0u ||
+            z == uint(cells_z))
+        {
+            return;
+        }
+
+
+        uint id =
+            z * (field_x * field_y)
+            + y * field_x
+            + x;
+
+
+        // ====================================================
+        // FACE AREAS
+        // ====================================================
+
+        float area_x = dy * dz;
+        float area_y = dx * dz;
+        float area_z = dx * dy;
+
+
+        // ====================================================
+        // W-CV GEOMETRY
+        //
+        // w_P:
+        //
+        // (x+1/2, y+1/2, z)
+        //
+        // E:
+        // (x+1, y+1/2, z)
+        //
+        // W:
+        // (x, y+1/2, z)
+        //
+        // N:
+        // (x+1/2, y, z)
+        //
+        // S:
+        // (x+1/2, y+1, z)
+        //
+        // T:
+        // (x+1/2, y+1/2, z-1/2)
+        //
+        // B:
+        // (x+1/2, y+1/2, z+1/2)
+        // ====================================================
+
+
+        // ====================================================
+        // TOP / BOTTOM NORMAL VELOCITY
+        //
+        // w itself is centered on the w-CV.
+        //
+        // Therefore interpolate w in z to the T/B faces.
+        //
+        // The T/B faces sit at z -/+ 1/2, which are pressure
+        // cell centres: always interior for 1 <= z <= cells_z-1.
+        // ====================================================
+
+        float w_T =
+            0.5 * (
+                w[wIndex(x, y, z - 1u)] +
+                w[wIndex(x, y, z)]
+            );
+
+        float w_B =
+            0.5 * (
+                w[wIndex(x, y, z)] +
+                w[wIndex(x, y, z + 1u)]
+            );
+
+
+        // ====================================================
+        // EAST / WEST NORMAL VELOCITY
+        //
+        // u is located exactly at:
+        //
+        // (x+1/2, y+1/2, z)
+        //
+        // relative to the w-CV's E/W faces.
+        //
+        // Therefore interpolate u in z.
+        //
+        // W face at x, E face at x+1.
+        // ====================================================
+
+        float u_W =
+            (x == 0u)
+            ? 0.0
+            : 0.5 * (
+                u[uIndex(x, y, z - 1u)] +
+                u[uIndex(x, y, z)]
+              );
+
+        float u_E =
+            (x == uint(cells_x - 1))
+            ? 0.0
+            : 0.5 * (
+                u[uIndex(x + 1u, y, z - 1u)] +
+                u[uIndex(x + 1u, y, z)]
+              );
+
+
+        // ====================================================
+        // NORTH / SOUTH NORMAL VELOCITY
+        //
+        // v is located at:
+        //
+        // (x+1/2, y, z+1/2)
+        //
+        // while N/S faces are at:
+        //
+        // (x+1/2, y, z)
+        //
+        // Therefore interpolate v in z.
+        //
+        // N face at y, S face at y+1.
+        // ====================================================
+
+        float v_N =
+            (y == 0u)
+            ? 0.0
+            : 0.5 * (
+                v[vIndex(x, y, z - 1u)] +
+                v[vIndex(x, y, z)]
+              );
+
+        float v_S =
+            (y == uint(cells_y - 1))
+            ? 0.0
+            : 0.5 * (
+                v[vIndex(x, y + 1u, z - 1u)] +
+                v[vIndex(x, y + 1u, z)]
+              );
+
+
+        // ====================================================
+        // SIGNED MASS FLUXES
+        // ====================================================
+
+        float F_E =  density * u_E * area_x;
+        float F_W = -density * u_W * area_x;
+
+        float F_S =  density * v_S * area_y;
+        float F_N = -density * v_N * area_y;
+
+        float F_B =  density * w_B * area_z;
+        float F_T = -density * w_T * area_z;
+
+
+        // ====================================================
+        // UPWIND COEFFICIENTS
+        // ====================================================
+
+        aP[id] +=
+              max(F_E, 0.0)
+            + max(F_W, 0.0)
+            + max(F_S, 0.0)
+            + max(F_N, 0.0)
+            + max(F_B, 0.0)
+            + max(F_T, 0.0);
+
+        aE[id] += min(F_E, 0.0);
+        aW[id] += min(F_W, 0.0);
+
+        aS[id] += min(F_S, 0.0);
+        aN[id] += min(F_N, 0.0);
+
+        aB[id] += min(F_B, 0.0);
+        aT[id] += min(F_T, 0.0);
+
+        // SECOND ORDER DEFERRED CORRECTION (RHS only, matrix stays first-order upwind). Faces whose stencil leaves the field
+        // (a wall-adjacent row sending flow AWAY from the wall, inflow into a row from the wall-adjacent row, inflow from a Dirichlet wall-normal node: each would need a node beyond the field) stay first-order; outflow TOWARDS the wall is corrected, the wall-side node being a legitimate downstream node, see face_correction.
+        if (ConvectionScheme == 1)
+        {
+            RHS_phi[id] -=
+                  face_correction(F_E, id, x, field_x, +1, 1u)
+                + face_correction(F_W, id, x, field_x, -1, 1u)
+                + face_correction(F_S, id, y, field_y, +1, field_x)
+                + face_correction(F_N, id, y, field_y, -1, field_x)
+                + face_correction(F_B, id, z, field_z, +1, field_x * field_y)
+                + face_correction(F_T, id, z, field_z, -1, field_x * field_y);
+        }
+    }
+}

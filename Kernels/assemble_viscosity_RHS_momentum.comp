@@ -1,0 +1,644 @@
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// ============================================================
+// RHS
+// ============================================================
+
+layout(std430, binding = 0)
+buffer RHSBuffer
+{
+    float RHS_main[];
+};
+
+// ============================================================
+// Staggered velocity fields
+// ============================================================
+
+layout(std430, binding = 1)
+buffer UBuffer
+{
+    float u[];
+};
+
+layout(std430, binding = 2)
+buffer VBuffer
+{
+    float v[];
+};
+
+layout(std430, binding = 3)
+buffer WBuffer
+{
+    float w[];
+};
+
+// ============================================================
+// Effective dynamic viscosity
+// ============================================================
+
+layout(std430, binding = 4)
+buffer MuEffBuffer
+{
+    float mu_eff[];
+};
+
+// ============================================================
+// Grid
+// ============================================================
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+// ============================================================
+// Topology
+//
+// 1 = XFACE / u
+// 2 = YFACE / v
+// 3 = ZFACE / w
+// ============================================================
+
+uniform int topology;
+
+// ============================================================
+// Indexing
+// ============================================================
+
+uint muIndex(uint x, uint y, uint z)
+{
+    return z * uint(cells_x * cells_y)
+         + y * uint(cells_x)
+         + x;
+}
+
+uint uIndex(uint x, uint y, uint z)
+{
+    uint nx = uint(cells_x + 1);
+
+    return z * (nx * uint(cells_y))
+         + y * nx
+         + x;
+}
+
+uint vIndex(uint x, uint y, uint z)
+{
+    uint ny = uint(cells_y + 1);
+
+    return z * (uint(cells_x) * ny)
+         + y * uint(cells_x)
+         + x;
+}
+
+uint wIndex(uint x, uint y, uint z)
+{
+    return z * (uint(cells_x) * uint(cells_y))
+         + y * uint(cells_x)
+         + x;
+}
+
+
+// ============================================================
+// WALL TREATMENT (no-slip, stationary walls)
+//
+// This kernel evaluates the CROSS components of the viscous
+// stress tensor explicitly, e.g. for the u equation:
+//
+//     d/dy [ mu * dv/dx ]  and  d/dz [ mu * dw/dx ]
+//
+// Two rules apply on a staggered no-slip domain:
+//
+// 1. WALL-NORMAL DOF
+//    u at x = 0 / cells_x, v at y = 0 / cells_y, w at
+//    z = 0 / cells_z lie ON a wall and are known to be zero.
+//    Their rows must stay clean Dirichlet rows, so this kernel
+//    must add NOTHING to their RHS -> early return.
+//
+// 2. CV FACE LYING ON A WALL
+//    Every cross-stress term differentiates a velocity
+//    component ALONG a wall plane on which that component is
+//    identically zero. For the u equation the N face at y = 0
+//    needs dv/dx evaluated on the plane y = 0, where v is zero
+//    everywhere, so dv/dx = 0 and the stress vanishes.
+//
+//    The same holds for every transverse wall face of every
+//    momentum CV, so a wall face simply contributes zero and
+//    the face viscosity there is irrelevant.
+// ============================================================
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    uint field_x;
+    uint field_y;
+    uint field_z;
+
+    // ========================================================
+    // Determine equation topology
+    // ========================================================
+
+    if (topology == 1)
+    {
+        field_x = uint(cells_x + 1);
+        field_y = uint(cells_y);
+        field_z = uint(cells_z);
+    }
+    else if (topology == 2)
+    {
+        field_x = uint(cells_x);
+        field_y = uint(cells_y + 1);
+        field_z = uint(cells_z);
+    }
+    else if (topology == 3)
+    {
+        field_x = uint(cells_x);
+        field_y = uint(cells_y);
+        field_z = uint(cells_z + 1);
+    }
+    else
+    {
+        return;
+    }
+
+    // ========================================================
+    // Bounds
+    // ========================================================
+
+    if (x >= field_x ||
+        y >= field_y ||
+        z >= field_z)
+    {
+        return;
+    }
+
+    uint id =
+        z * (field_x * field_y)
+        + y * field_x
+        + x;
+
+    // ========================================================
+    // Face areas
+    // ========================================================
+
+    float area_x = dy * dz;
+    float area_y = dx * dz;
+    float area_z = dx * dy;
+
+
+    // ========================================================
+    // XFACE / u
+    //
+    // Cross terms:
+    //
+    // d/dy [ mu * dv/dx ]
+    // d/dz [ mu * dw/dx ]
+    // ========================================================
+
+    if (topology == 1)
+    {
+        // ----------------------------------------------------
+        // Wall-normal DOF -> Dirichlet row, contribute nothing.
+        // ----------------------------------------------------
+
+        if (x == 0u ||
+            x == uint(cells_x))
+        {
+            return;
+        }
+
+
+        // ====================================================
+        // NORTH  (face at y)
+        //
+        // Physical location:
+        //
+        //     (x, y, z + 1/2)
+        //
+        // v sits at (x + 1/2, y, z + 1/2), so dv/dx at x comes
+        // from the two v nodes straddling x.
+        // ====================================================
+
+        float tau_xy_N;
+
+        if (y == 0u)
+        {
+            // Face on the y = 0 wall: v is zero across it.
+            tau_xy_N = 0.0;
+        }
+        else
+        {
+            float muN = 0.25 * (
+                mu_eff[muIndex(x - 1u, y - 1u, z)] +
+                mu_eff[muIndex(x,      y - 1u, z)] +
+                mu_eff[muIndex(x - 1u, y,      z)] +
+                mu_eff[muIndex(x,      y,      z)]
+            );
+
+            float v_x_N = (v[vIndex(x, y, z)] - v[vIndex(x - 1u, y, z)]) / dx;
+
+            tau_xy_N = muN * v_x_N;
+        }
+
+
+        // ====================================================
+        // SOUTH  (face at y+1)
+        //
+        // Physical location:
+        //
+        //     (x, y + 1, z + 1/2)
+        // ====================================================
+
+        float tau_xy_S;
+
+        if (y == uint(cells_y - 1))
+        {
+            // Face on the y = cells_y wall.
+            tau_xy_S = 0.0;
+        }
+        else
+        {
+            float muS = 0.25 * (
+                mu_eff[muIndex(x - 1u, y,      z)] +
+                mu_eff[muIndex(x,      y,      z)] +
+                mu_eff[muIndex(x - 1u, y + 1u, z)] +
+                mu_eff[muIndex(x,      y + 1u, z)]
+            );
+
+            float v_x_S = (v[vIndex(x, y + 1u, z)] - v[vIndex(x - 1u, y + 1u, z)]) / dx;
+
+            tau_xy_S = muS * v_x_S;
+        }
+
+
+        // ====================================================
+        // TOP  (face at z)
+        //
+        // Physical location:
+        //
+        //     (x, y + 1/2, z)
+        //
+        // w sits at (x + 1/2, y + 1/2, z), so dw/dx at x comes
+        // from the two w nodes straddling x.
+        // ====================================================
+
+        float tau_xz_T;
+
+        if (z == 0u)
+        {
+            // Face on the z = 0 wall.
+            tau_xz_T = 0.0;
+        }
+        else
+        {
+            float muT = 0.25 * (
+                mu_eff[muIndex(x - 1u, y, z - 1u)] +
+                mu_eff[muIndex(x,      y, z - 1u)] +
+                mu_eff[muIndex(x - 1u, y, z)] +
+                mu_eff[muIndex(x,      y, z)]
+            );
+
+            float w_x_T = (w[wIndex(x, y, z)] - w[wIndex(x - 1u, y, z)]) / dx;
+
+            tau_xz_T = muT * w_x_T;
+        }
+
+
+        // ====================================================
+        // BOTTOM  (face at z+1)
+        // ====================================================
+
+        float tau_xz_B;
+
+        if (z == uint(cells_z - 1))
+        {
+            // Face on the z = cells_z wall.
+            tau_xz_B = 0.0;
+        }
+        else
+        {
+            float muB = 0.25 * (
+                mu_eff[muIndex(x - 1u, y, z)] +
+                mu_eff[muIndex(x,      y, z)] +
+                mu_eff[muIndex(x - 1u, y, z + 1u)] +
+                mu_eff[muIndex(x,      y, z + 1u)]
+            );
+
+            float w_x_B = (w[wIndex(x, y, z + 1u)] - w[wIndex(x - 1u, y, z + 1u)]) / dx;
+
+            tau_xz_B = muB * w_x_B;
+        }
+
+
+        // ====================================================
+        // Cross-stress divergence
+        // ====================================================
+
+        RHS_main[id] += area_y * (tau_xy_S - tau_xy_N) + area_z * (tau_xz_B - tau_xz_T);
+    }
+
+
+    // ========================================================
+    // YFACE / v
+    //
+    // Cross terms:
+    //
+    // d/dx [ mu * du/dy ]
+    // d/dz [ mu * dw/dy ]
+    // ========================================================
+
+    else if (topology == 2)
+    {
+        // ----------------------------------------------------
+        // Wall-normal DOF -> Dirichlet row, contribute nothing.
+        // ----------------------------------------------------
+
+        if (y == 0u ||
+            y == uint(cells_y))
+        {
+            return;
+        }
+
+
+        // ====================================================
+        // WEST  (face at x)
+        //
+        // Physical location:
+        //
+        //     (x, y, z + 1/2)
+        //
+        // u sits at (x, y + 1/2, z + 1/2), so du/dy at y comes
+        // from the two u nodes straddling y.
+        // ====================================================
+
+        float tau_xy_W;
+
+        if (x == 0u)
+        {
+            // Face on the x = 0 wall: u is zero across it.
+            tau_xy_W = 0.0;
+        }
+        else
+        {
+            float muW = 0.25 * (
+                mu_eff[muIndex(x - 1u, y - 1u, z)] +
+                mu_eff[muIndex(x - 1u, y,      z)] +
+                mu_eff[muIndex(x,      y - 1u, z)] +
+                mu_eff[muIndex(x,      y,      z)]
+            );
+
+            float u_y_W =
+                (u[uIndex(x, y, z)] - u[uIndex(x, y - 1u, z)]) / dy;
+
+            tau_xy_W = muW * u_y_W;
+        }
+
+
+        // ====================================================
+        // EAST  (face at x+1)
+        // ====================================================
+
+        float tau_xy_E;
+
+        if (x == uint(cells_x - 1))
+        {
+            // Face on the x = cells_x wall.
+            tau_xy_E = 0.0;
+        }
+        else
+        {
+            float muE = 0.25 * (
+                mu_eff[muIndex(x,      y - 1u, z)] +
+                mu_eff[muIndex(x + 1u, y - 1u, z)] +
+                mu_eff[muIndex(x,      y,      z)] +
+                mu_eff[muIndex(x + 1u, y,      z)]
+            );
+
+            float u_y_E = (u[uIndex(x + 1u, y, z)] - u[uIndex(x + 1u, y - 1u, z)]) / dy;
+
+            tau_xy_E = muE * u_y_E;
+        }
+
+
+        // ====================================================
+        // TOP  (face at z)
+        //
+        // Physical location:
+        //
+        //     (x + 1/2, y, z)
+        //
+        // w sits at (x + 1/2, y + 1/2, z), so dw/dy at y comes
+        // from the two w nodes straddling y.
+        // ====================================================
+
+        float tau_yz_T;
+
+        if (z == 0u)
+        {
+            // Face on the z = 0 wall.
+            tau_yz_T = 0.0;
+        }
+        else
+        {
+            float muT = 0.25 * (
+                mu_eff[muIndex(x, y - 1u, z - 1u)] +
+                mu_eff[muIndex(x, y,      z - 1u)] +
+                mu_eff[muIndex(x, y - 1u, z)] +
+                mu_eff[muIndex(x, y,      z)]
+            );
+
+            float w_y_T = (w[wIndex(x, y, z)] - w[wIndex(x, y - 1u, z)]) / dy;
+
+            tau_yz_T = muT * w_y_T;
+        }
+
+
+        // ====================================================
+        // BOTTOM  (face at z+1)
+        // ====================================================
+
+        float tau_yz_B;
+
+        if (z == uint(cells_z - 1))
+        {
+            // Face on the z = cells_z wall.
+            tau_yz_B = 0.0;
+        }
+        else
+        {
+            float muB = 0.25 * (
+                mu_eff[muIndex(x, y - 1u, z)] +
+                mu_eff[muIndex(x, y,      z)] +
+                mu_eff[muIndex(x, y - 1u, z + 1u)] +
+                mu_eff[muIndex(x, y,      z + 1u)]
+            );
+
+            float w_y_B = (w[wIndex(x, y, z + 1u)] - w[wIndex(x, y - 1u, z + 1u)]) / dy;
+
+            tau_yz_B = muB * w_y_B;
+        }
+
+
+        // ====================================================
+        // Cross-stress divergence
+        // ====================================================
+
+        RHS_main[id] += area_x * (tau_xy_E - tau_xy_W) + area_z * (tau_yz_B - tau_yz_T);
+    }
+
+
+    // ========================================================
+    // ZFACE / w
+    //
+    // Cross terms:
+    //
+    // d/dx [ mu * du/dz ]
+    // d/dy [ mu * dv/dz ]
+    // ========================================================
+
+    else
+    {
+        // ----------------------------------------------------
+        // Wall-normal DOF -> Dirichlet row, contribute nothing.
+        // ----------------------------------------------------
+
+        if (z == 0u ||
+            z == uint(cells_z))
+        {
+            return;
+        }
+
+
+        // ====================================================
+        // WEST  (face at x)
+        //
+        // Physical location:
+        //
+        //     (x, y + 1/2, z)
+        //
+        // u sits at (x, y + 1/2, z + 1/2), so du/dz at z comes
+        // from the two u nodes straddling z.
+        // ====================================================
+
+        float tau_xz_W;
+
+        if (x == 0u)
+        {
+            // Face on the x = 0 wall.
+            tau_xz_W = 0.0;
+        }
+        else
+        {
+            float muW = 0.25 * (
+                mu_eff[muIndex(x - 1u, y, z - 1u)] +
+                mu_eff[muIndex(x - 1u, y, z)] +
+                mu_eff[muIndex(x,      y, z - 1u)] +
+                mu_eff[muIndex(x,      y, z)]
+            );
+
+            float u_z_W = (u[uIndex(x, y, z)] - u[uIndex(x, y, z - 1u)]) / dz;
+
+            tau_xz_W = muW * u_z_W;
+        }
+
+
+        // ====================================================
+        // EAST  (face at x+1)
+        // ====================================================
+
+        float tau_xz_E;
+
+        if (x == uint(cells_x - 1))
+        {
+            // Face on the x = cells_x wall.
+            tau_xz_E = 0.0;
+        }
+        else
+        {
+            float muE = 0.25 * (
+                mu_eff[muIndex(x,      y, z - 1u)] +
+                mu_eff[muIndex(x,      y, z)] +
+                mu_eff[muIndex(x + 1u, y, z - 1u)] +
+                mu_eff[muIndex(x + 1u, y, z)]
+            );
+
+            float u_z_E = (u[uIndex(x + 1u, y, z)] - u[uIndex(x + 1u, y, z - 1u)]) / dz;
+
+            tau_xz_E = muE * u_z_E;
+        }
+
+
+        // ====================================================
+        // NORTH  (face at y)
+        //
+        // Physical location:
+        //
+        //     (x + 1/2, y, z)
+        //
+        // v sits at (x + 1/2, y, z + 1/2), so dv/dz at z comes
+        // from the two v nodes straddling z.
+        // ====================================================
+
+        float tau_yz_N;
+
+        if (y == 0u)
+        {
+            // Face on the y = 0 wall.
+            tau_yz_N = 0.0;
+        }
+        else
+        {
+            float muN = 0.25 * (
+                mu_eff[muIndex(x, y - 1u, z - 1u)] +
+                mu_eff[muIndex(x, y - 1u, z)] +
+                mu_eff[muIndex(x, y,      z - 1u)] +
+                mu_eff[muIndex(x, y,      z)]
+            );
+
+            float v_z_N = (v[vIndex(x, y, z)] - v[vIndex(x, y, z - 1u)]) / dz;
+
+            tau_yz_N = muN * v_z_N;
+        }
+
+
+        // ====================================================
+        // SOUTH  (face at y+1)
+        // ====================================================
+
+        float tau_yz_S;
+
+        if (y == uint(cells_y - 1))
+        {
+            // Face on the y = cells_y wall.
+            tau_yz_S = 0.0;
+        }
+        else
+        {
+            float muS = 0.25 * (
+                mu_eff[muIndex(x, y,      z - 1u)] +
+                mu_eff[muIndex(x, y,      z)] +
+                mu_eff[muIndex(x, y + 1u, z - 1u)] +
+                mu_eff[muIndex(x, y + 1u, z)]
+            );
+
+            float v_z_S = (v[vIndex(x, y + 1u, z)] - v[vIndex(x, y + 1u, z - 1u)]) / dz;
+
+            tau_yz_S = muS * v_z_S;
+        }
+
+
+        // ====================================================
+        // Cross-stress divergence
+        // ====================================================
+
+        RHS_main[id] += area_x * (tau_xz_E - tau_xz_W) + area_y * (tau_yz_S - tau_yz_N);
+    }
+}

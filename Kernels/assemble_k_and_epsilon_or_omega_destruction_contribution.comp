@@ -1,0 +1,109 @@
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+uniform float density;
+
+uniform bool is_omega_model;
+uniform bool is_k;
+uniform bool is_sst;    // Always false if is_omega_model is false
+
+layout(std430, binding = 0) readonly buffer KField
+{
+    float k[];
+};
+
+layout(std430, binding = 1) readonly buffer DestructionVariable
+{
+    // epsilon for k-epsilon
+    // omega   for k-omega / k-omega SST
+    float destruction_variable[];
+};
+
+layout(std430, binding = 2) buffer aP_k_or_destruction_variable
+{
+    float aP[];
+};
+
+layout(std430, binding = 3) readonly buffer F1      // ONLY AND ONLY attached when is_sst is true else ignored and not attached
+{
+    float blended_coefficient[];
+};
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= grid_x || y >= grid_y || z >= grid_z)
+        return;
+
+    // Boundary cells are handled by the wall treatment.
+    if (x == 0u || x == grid_x - 1u ||
+        y == 0u || y == grid_y - 1u ||
+        z == 0u || z == grid_z - 1u)
+        return;
+
+    uint id = index_cell(x, y, z);
+
+    float beta_star = 0.09;           // model coefficient for omega based models
+    float C_eps_2 = 1.92;            // MODEL CONSTANT FOR EPSILON
+    float beta_for_omega = 0.075;   // MODEL CONSTANT FOR OMEGA
+
+    float volume = dx * dy * dz;
+
+    float destruction_for_variable;       // Can be k or destruction varaible (eps / omega)
+    if (is_omega_model)
+    {
+    // k-omega and k-omega SST share the same k-destruction term:
+    // D_k = beta_star * rho * k * omega
+    // Implicit linearization:
+    // aP += beta_star * rho * omega_P * volume
+        if(is_k)
+            destruction_for_variable = beta_star * density * destruction_variable[id] * volume;        //k omega model destruction contrubution for k
+        else
+        {
+            float beta = beta_for_omega;
+            if (is_sst)
+            {
+                const float beta_1 = 0.075;
+                const float beta_2 = 0.0828;
+                float F1 = blended_coefficient[id];
+                beta = (F1 * beta_1) + ((1.0 - F1) * beta_2);       // SST: beta blended by F1
+            }
+            destruction_for_variable = beta * density * destruction_variable[id] * volume;   //k omega model destruction contrubution for omega
+        }
+    }
+    else
+    {
+        // k-epsilon:
+        // D_k = rho epsilon volume
+        if(is_k)
+        {
+            destruction_for_variable = density * (destruction_variable[id] / (k[id] + 1.17549435e-38)) * volume;      // Linearization rho (eps / k) multiplies with the next k to give rho eps which is the destruction term in the equations
+        }
+        else
+        {
+            float eps_over_k = destruction_variable[id] / (k[id] + 1.17549435e-38);
+            destruction_for_variable = C_eps_2 * density * eps_over_k * volume;   //The k epsilon destruction contrubution for epsilon
+        }
+    }
+
+    aP[id] += destruction_for_variable;
+}

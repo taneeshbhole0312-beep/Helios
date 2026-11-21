@@ -1,0 +1,71 @@
+#version 430 core
+
+layout( local_size_x = 8,
+        local_size_y = 8,
+        local_size_z = 8) in;
+
+
+// ============================================================
+// k-oemga field initialization (uniform, every cell)
+//
+//   k0   = 3/2 * (U_ref * I)^2
+//   eps0 = C_mu^(3/4) * k0^(3/2) / L
+//
+// U_ref = reference_velocity, I = turbulence_intensity,
+// L = turbulence_length_scale (must be > 0, checked on the CPU).
+// ============================================================
+
+// Cell-centered grid dimensions
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+
+uniform float reference_velocity;
+uniform float turbulence_intensity;
+uniform float turbulence_length_scale;
+
+const float C_mu = 0.09;
+
+
+// Cell-centered k (output)
+layout(std430, binding = 0) writeonly buffer KField
+{
+    float k[];
+};
+
+// Cell-centered epsilon (output)
+layout(std430, binding = 1) writeonly buffer EpsilonField
+{
+    float eps[];
+};
+
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= grid_x || y >= grid_y || z >= grid_z)
+        return;
+
+    uint id = index_cell(x, y, z);
+
+    float velocity_fluctuation = reference_velocity * turbulence_intensity;
+
+    float k0 = 1.5 * velocity_fluctuation * velocity_fluctuation;
+
+    // k0^(3/2) written as k0 * sqrt(k0)
+    float eps0 = pow(C_mu, 0.75) * k0 * sqrt(k0) / turbulence_length_scale;
+
+    k[id]   = k0;
+    eps[id] = eps0;
+}

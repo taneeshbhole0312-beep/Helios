@@ -1,0 +1,187 @@
+STAGGERED GRID INDEX MAPPING — HELIOS
+
+Grid dimensions:
+
+CELL CENTERED:
+    Nx × Ny × Nz
+    x = 0 ... Nx-1
+    y = 0 ... Ny-1
+    z = 0 ... Nz-1
+
+XFACE CENTERED (u):
+    (Nx+1) × Ny × Nz
+    x = 0 ... Nx
+    y = 0 ... Ny-1
+    z = 0 ... Nz-1
+
+YFACE CENTERED (v):
+    Nx × (Ny+1) × Nz
+    x = 0 ... Nx-1
+    y = 0 ... Ny
+    z = 0 ... Nz-1
+
+ZFACE CENTERED (w):
+    Nx × Ny × (Nz+1)
+    x = 0 ... Nx-1
+    y = 0 ... Ny-1
+    z = 0 ... Nz
+
+
+COORDINATE CONVENTION:
+
+    +X = E
+    -X = W
+
+    +Y = S
+    -Y = N
+
+    +Z = B
+    -Z = T
+
+
+============================================================
+FACE → CELL MAPPING
+============================================================
+
+XFACE (u[x,y,z]):
+
+    W cell = cell[x-1, y, z]
+    E cell = cell[x,   y, z]
+
+    N cells:
+        cell[x-1, y-1, z]
+        cell[x,   y-1, z]
+
+    S cells:
+        cell[x-1, y, z]
+        cell[x,   y, z]
+
+    T cells:
+        cell[x-1, y, z-1]
+        cell[x,   y, z-1]
+
+    B cells:
+        cell[x-1, y, z]
+        cell[x,   y, z]
+
+
+YFACE (v[x,y,z]):
+
+    N cell = cell[x, y-1, z]
+    S cell = cell[x, y,   z]
+
+    W cells:
+        cell[x-1, y-1, z]
+        cell[x-1, y,   z]
+
+    E cells:
+        cell[x, y-1, z]
+        cell[x, y,   z]
+
+    T cells:
+        cell[x, y-1, z-1]
+        cell[x, y,   z-1]
+
+    B cells:
+        cell[x, y-1, z]
+        cell[x, y,   z]
+
+
+ZFACE (w[x,y,z]):
+
+    T cell = cell[x, y, z-1]
+    B cell = cell[x, y, z]
+
+    W cells:
+        cell[x-1, y, z-1]
+        cell[x-1, y, z]
+
+    E cells:
+        cell[x, y, z-1]
+        cell[x, y, z]
+
+    N cells:
+        cell[x, y-1, z-1]
+        cell[x, y-1, z]
+
+    S cells:
+        cell[x, y, z-1]
+        cell[x, y, z]
+
+
+============================================================
+CELL → FACE MAPPING
+============================================================
+
+Given cell[x,y,z]:
+
+XFACE (u):
+
+    W face = u[x,   y, z]
+    E face = u[x+1, y, z]
+
+
+YFACE (v):
+
+    N face = v[x, y,   z]
+    S face = v[x, y+1, z]
+
+
+ZFACE (w):
+
+    T face = w[x, y, z]
+    B face = w[x, y, z+1]
+
+
+============================================================
+CORE RULE
+============================================================
+
+A face-centered field has one extra element in its
+face-normal direction.
+
+XFACE:
+    u[x] lies between cell[x-1] and cell[x]
+
+YFACE:
+    v[y] lies between cell[y-1] and cell[y]
+
+ZFACE:
+    w[z] lies between cell[z-1] and cell[z]
+
+
+Therefore:
+
+    XFACE → CELL:
+        W = x-1
+        E = x
+
+    YFACE → CELL:
+        N = y-1
+        S = y
+
+    ZFACE → CELL:
+        T = z-1
+        B = z
+
+
+CELL → FACE:
+
+    X:
+        W = x
+        E = x+1
+
+    Y:
+        N = y
+        S = y+1
+
+    Z:
+        T = z
+        B = z+1
+
+
+IMPORTANT:
+The above mappings describe geometric adjacency.
+For interpolation of a cell-centered quantity onto
+a TRANSVERSE face of a staggered control volume, multiple
+surrounding cell-centered values may be required.

@@ -1,0 +1,236 @@
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+
+// ========================================================================
+// Grid / physical parameters
+// ========================================================================
+
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+uniform float dt;
+uniform float density;
+
+
+// ========================================================================
+// Topology
+//
+// 1 = XFACE / u
+// 2 = YFACE / v
+// 3 = ZFACE / w
+//
+// Needed only to identify the wall-normal degrees of freedom, whose rows
+// must stay pure Dirichlet rows.
+// ========================================================================
+
+uniform int topology;
+uniform bool coarse_assembly;
+uniform int tempoaral_scheme;   // A enum int that corresponds to the scheme at that number in the class TemporalScheme
+
+
+// ========================================================================
+// Previous-time-step velocity field
+//
+// The CPU binds the appropriate field here:
+//
+//     u equation -> vx_old
+//     v equation -> vy_old
+//     w equation -> vz_old
+//
+// The field must have the same dimensions as the coefficient arrays
+// being assembled.
+// ========================================================================
+
+layout(std430, binding = 0) readonly buffer PreviousVelocity
+{
+    float phi_old[];
+};
+
+layout(std430, binding = 1) readonly buffer PreviousPreviousVelocity
+{
+    float phi_older[];
+};
+
+// ========================================================================
+// Linear-system storage
+//
+// The CPU binds the coefficient arrays belonging to the particular
+// momentum LinearSystem being assembled.
+//
+// u equation -> uSystem coefficients
+// v equation -> vSystem coefficients
+// w equation -> wSystem coefficients
+// ========================================================================
+
+layout(std430, binding = 2) buffer AP
+{
+    float aP[];
+};
+
+layout(std430, binding = 3) buffer RHS
+{
+    float RHS_main[];
+};
+
+
+// ========================================================================
+// Indexing
+//
+// This kernel does not care whether the grid is:
+//
+//     (Nx+1) × Ny × Nz       -> u
+//     Nx × (Ny+1) × Nz       -> v
+//     Nx × Ny × (Nz+1)       -> w
+//
+// The caller simply supplies the correct grid_x/grid_y/grid_z.
+// ========================================================================
+
+uint index3D(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+
+// ========================================================================
+// Main
+// ========================================================================
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= grid_x ||
+        y >= grid_y ||
+        z >= grid_z)
+    {
+        return;
+    }
+
+    uint id = index3D(x, y, z);
+
+    bool boundary_cell =
+        x == 0u || x == grid_x - 1u
+        || y == 0u || y == grid_y - 1u
+        || z == 0u || z == grid_z - 1u;
+
+    if (topology == 0 && boundary_cell)
+    {
+        return;
+    }
+
+
+    // ====================================================================
+    // Control-volume volume
+    //
+    // For the present uniform Cartesian staggered grid, each momentum
+    // control volume has volume:
+    //
+    //     V = dx * dy * dz
+    //
+    // including the normal interior momentum CVs.
+    //
+    // Boundary treatment can be handled separately by the equation
+    // assembler.
+    // ====================================================================
+
+    float volume = dx * dy * dz;
+
+
+    // ====================================================================
+    // Backward-Euler transient coefficient
+    //
+    //     rho * V / dt
+    //
+    // BDF2 transient coefficient for aP
+    // 3 * rho * V / 2 * dt
+    // and for RHS
+    // rho * V / 2 * dt      
+    // ====================================================================
+    float transientCoefficient;
+    if(tempoaral_scheme == 0)                       //Backward Euler
+    {
+        transientCoefficient = density * volume / dt;
+    }
+    else if (tempoaral_scheme == 1)                 //BDF2
+    {
+        transientCoefficient = (3.0 * density * volume) / (2.0 * dt);
+    }
+    else
+    {
+        return;
+    }
+
+    // ====================================================================
+    // Wall-normal degrees of freedom
+    //
+    // On a staggered grid the velocity component normal to a wall has its
+    // node lying exactly ON the wall plane:
+    //
+    //     u at x = 0 / cells_x
+    //     v at y = 0 / cells_y
+    //     w at z = 0 / cells_z
+    //
+    // No penetration fixes those values at zero, so they are not solved
+    // for. The convection and viscous assembly kernels deliberately skip
+    // them, which leaves the row completely empty apart from what is
+    // written below.
+    //
+    // Writing only the diagonal here, and NOT the phi^n source, turns the
+    // row into
+    //
+    //     (rho * V / dt) * phi = 0
+    //
+    // i.e. an exact Dirichlet condition phi = 0. Adding the phi^n term
+    // instead would merely freeze whatever value the field happened to
+    // hold, which is not the same thing.
+    // ====================================================================
+
+    bool wall_normal_dof =
+           (topology == 1 && (x == 0u || x == grid_x - 1u))
+        || (topology == 2 && (y == 0u || y == grid_y - 1u))
+        || (topology == 3 && (z == 0u || z == grid_z - 1u));
+
+
+    // ====================================================================
+    // Add transient contribution to the diagonal
+    // ====================================================================
+
+    aP[id] += transientCoefficient;
+
+
+    // ====================================================================
+    // Add previous-time-step contribution to RHS
+    //
+    //     rho * V / dt * phi^n
+    // ====================================================================
+
+
+    if(!coarse_assembly)
+    {
+        if (!wall_normal_dof)
+        {   if(tempoaral_scheme == 0)   // backward Euler
+            {
+                RHS_main[id] += transientCoefficient * phi_old[id];
+            }
+            else if(tempoaral_scheme == 1)  //BDF2
+            {
+                float first_part = (volume * density) / (2.0 * dt);
+                float second_part = ((4.0 * phi_old[id]) - phi_older[id]);
+
+                RHS_main[id] += first_part * second_part;
+            }
+
+        }
+    }
+}

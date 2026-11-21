@@ -1,0 +1,83 @@
+#version 430 core
+
+layout(local_size_x = 8,
+       local_size_y = 8,
+       local_size_z = 8) in;
+
+layout(std430, binding = 0)
+buffer PressureBuf
+{
+    float pressure[];
+};
+
+layout(std430, binding = 1)
+buffer MACDBuffer
+{
+    float MAC_d[];
+};
+
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float cell_side_z;
+uniform float stable_dt;
+uniform float density;
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    // vz grid: cells_x columns, cells_y rows, (cells_z + 1) layers
+    if (x >= uint(cells_x) ||
+        y >= uint(cells_y) ||
+        z >= uint(cells_z + 1))
+    {
+        return;
+    }
+
+    uint layer_stride = uint(cells_x * cells_y);
+
+    // the vz lattice and the pressure lattice share the same layer stride and
+    // in-layer indexing, so this one index serves as both
+    uint d_idx = z * layer_stride + y * uint(cells_x) + x;
+
+    float p_t;
+    float p_b;
+
+    if (z > 0u)
+    {
+        uint top_idx = d_idx - layer_stride;
+
+        p_t = pressure[top_idx];
+    }
+    else
+    {
+        p_t = 0.0;
+    }
+
+    if (z < uint(cells_z))
+    {
+        uint bottom_idx = d_idx;
+
+        p_b = pressure[bottom_idx];
+    }
+    else
+    {
+        p_b = 0.0;
+    }
+
+    float pressure_gradient_z = (p_b - p_t) / cell_side_z;
+
+    MAC_d[d_idx] -= pressure_gradient_z * (stable_dt / density);
+
+    if (z == 0u ||
+        z == uint(cells_z))
+    {
+        MAC_d[d_idx] = 0.0;
+    }
+
+}

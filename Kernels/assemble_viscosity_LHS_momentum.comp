@@ -1,0 +1,683 @@
+#version 430 core
+
+layout(local_size_x = 8,
+       local_size_y = 8,
+       local_size_z = 8) in;
+
+
+// ============================================================
+// Linear-system coefficients
+// ============================================================
+
+layout(std430, binding = 0)
+buffer APBuffer
+{
+    float aP[];
+};
+
+layout(std430, binding = 1)
+buffer AWBuffer
+{
+    float aW[];
+};
+
+layout(std430, binding = 2)
+buffer AEBuffer
+{
+    float aE[];
+};
+
+layout(std430, binding = 3)
+buffer ASBuffer
+{
+    float aS[];
+};
+
+layout(std430, binding = 4)
+buffer ANBuffer
+{
+    float aN[];
+};
+
+layout(std430, binding = 5)
+buffer ABBuffer
+{
+    float aB[];
+};
+
+layout(std430, binding = 6)
+buffer ATBuffer
+{
+    float aT[];
+};
+
+
+// ============================================================
+// Effective dynamic viscosity
+//
+// CELL_CENTERED:
+//     cells_x × cells_y × cells_z
+//
+// mu_eff = mu + mu_t
+// ============================================================
+
+layout(std430, binding = 7)
+buffer MuEffBuffer
+{
+    float mu_eff[];
+};
+
+
+// ============================================================
+// Grid
+// ============================================================
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+
+// ============================================================
+// Topology
+//
+// 0 = CELL_CENTERED
+// 1 = XFACE_CENTERED   -> u
+// 2 = YFACE_CENTERED   -> v
+// 3 = ZFACE_CENTERED   -> w
+//
+// This kernel is intended for momentum fields, so only
+// XFACE/YFACE/ZFACE are assembled.
+// ============================================================
+
+uniform int topology;
+
+
+// ============================================================
+// Cell-centered viscosity indexing
+// ============================================================
+
+uint muIndex(uint x, uint y, uint z)
+{
+    return z * uint(cells_x * cells_y)
+         + y * uint(cells_x)
+         + x;
+}
+
+
+// ============================================================
+// WALL TREATMENT (no-slip, stationary walls)
+//
+// Walls sit at x = 0, x = cells_x, y = 0, y = cells_y,
+// z = 0, z = cells_z.
+//
+// 1. WALL-NORMAL DOF
+//    u at x = 0 / cells_x, v at y = 0 / cells_y,
+//    w at z = 0 / cells_z lie exactly ON a wall plane and are
+//    known to be zero (no penetration). No diffusion equation
+//    is assembled for them: this kernel returns early so the
+//    row stays a clean Dirichlet row supplied by the transient
+//    kernel.
+//
+// 2. CV FACE LYING ON A WALL
+//    For an interior DOF whose CV has a transverse face on a
+//    wall, this kernel adds NOTHING. The wall shear stress is
+//    supplied by momentum_wall_contribution.comp as an implicit
+//    diagonal term aP += rho*u_tau^2*A/|U_t| (Spalding). In the
+//    viscous sublayer (y+ -> 0) that term reduces exactly to the
+//    laminar half-cell no-slip term mu*A/(delta/2), so laminar
+//    walls are still handled correctly.
+//
+//    (The former half-cell term used a 4-cell mu average whose
+//    wall-cell mu_eff carries the wall-function mu_t ~ rho*kappa*
+//    u_tau*y; that over-predicts tau_w by ~kappa*u+/2 and would
+//    double count once the wall function is applied.)
+//
+// 3. NORMAL-DIRECTION FACES
+//    These always fall on pressure-cell centres and are never
+//    on a wall for an assembled DOF. They carry the factor of
+//    two from the 2*mu*d(phi)/dn normal stress component.
+// ============================================================
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+
+    // ========================================================
+    // Determine momentum-field dimensions
+    // ========================================================
+
+    uint field_x;
+    uint field_y;
+    uint field_z;
+
+
+    if (topology == 1)                 // XFACE / u
+    {
+        field_x = uint(cells_x + 1);
+        field_y = uint(cells_y);
+        field_z = uint(cells_z);
+    }
+    else if (topology == 2)            // YFACE / v
+    {
+        field_x = uint(cells_x);
+        field_y = uint(cells_y + 1);
+        field_z = uint(cells_z);
+    }
+    else if (topology == 3)            // ZFACE / w
+    {
+        field_x = uint(cells_x);
+        field_y = uint(cells_y);
+        field_z = uint(cells_z + 1);
+    }
+    else
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // Bounds check against the actual momentum grid
+    // ========================================================
+
+    if (x >= field_x ||
+        y >= field_y ||
+        z >= field_z)
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // Momentum-field linear index
+    // ========================================================
+
+    uint field_layer_stride = field_x * field_y;
+
+    uint id =
+        z * field_layer_stride +
+        y * field_x +
+        x;
+
+
+    // ========================================================
+    // Face areas
+    //
+    // X-normal face:
+    //     dy * dz
+    //
+    // Y-normal face:
+    //     dx * dz
+    //
+    // Z-normal face:
+    //     dx * dy
+    // ========================================================
+
+    float area_x = dy * dz;
+    float area_y = dx * dz;
+    float area_z = dx * dy;
+
+
+    // ========================================================
+    // XFACE / u
+    //
+    // u grid:
+    //
+    //     (cells_x + 1)
+    //     × cells_y
+    //     × cells_z
+    //
+    // W/E are normal to the u CV and therefore use ONE
+    // cell-centered viscosity (with the factor of two).
+    //
+    // N/S/T/B are transverse faces and require FOUR
+    // surrounding cell-centered viscosities.
+    // ========================================================
+
+    if (topology == 1)
+    {
+        // ----------------------------------------------------
+        // Wall-normal DOF -> Dirichlet, nothing assembled.
+        // ----------------------------------------------------
+
+        if (x == 0u ||
+            x == uint(cells_x))
+        {
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // WEST / EAST  (normal direction, always interior)
+        //
+        // W face at x-1/2 -> cell (x-1, y, z)
+        // E face at x+1/2 -> cell (x,   y, z)
+        // ----------------------------------------------------
+
+        float muW = 2.0 * mu_eff[muIndex(x - 1u, y, z)];
+        float muE = 2.0 * mu_eff[muIndex(x,      y, z)];
+
+        float DW = muW * area_x / dx;
+        float DE = muE * area_x / dx;
+
+        aP[id] += DW + DE;
+
+        aW[id] -= DW;
+        aE[id] -= DE;
+
+
+        // ----------------------------------------------------
+        // NORTH  (transverse, face at y)
+        // ----------------------------------------------------
+
+        if (y == 0u)
+        {
+            // Face lies on the y = 0 wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muN = 0.25 * (
+                mu_eff[muIndex(x - 1u, y - 1u, z)] +
+                mu_eff[muIndex(x,      y - 1u, z)] +
+                mu_eff[muIndex(x - 1u, y,      z)] +
+                mu_eff[muIndex(x,      y,      z)]
+            );
+
+            float DN = muN * area_y / dy;
+
+            aP[id] += DN;
+            aN[id] -= DN;
+        }
+
+
+        // ----------------------------------------------------
+        // SOUTH  (transverse, face at y+1)
+        // ----------------------------------------------------
+
+        if (y == uint(cells_y - 1))
+        {
+            // Face lies on the y = cells_y wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muS = 0.25 * (
+                mu_eff[muIndex(x - 1u, y,      z)] +
+                mu_eff[muIndex(x,      y,      z)] +
+                mu_eff[muIndex(x - 1u, y + 1u, z)] +
+                mu_eff[muIndex(x,      y + 1u, z)]
+            );
+
+            float DS = muS * area_y / dy;
+
+            aP[id] += DS;
+            aS[id] -= DS;
+        }
+
+
+        // ----------------------------------------------------
+        // TOP  (transverse, face at z)
+        // ----------------------------------------------------
+
+        if (z == 0u)
+        {
+            // Face lies on the z = 0 wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muT = 0.25 * (
+                mu_eff[muIndex(x - 1u, y, z - 1u)] +
+                mu_eff[muIndex(x,      y, z - 1u)] +
+                mu_eff[muIndex(x - 1u, y, z)] +
+                mu_eff[muIndex(x,      y, z)]
+            );
+
+            float DT = muT * area_z / dz;
+
+            aP[id] += DT;
+            aT[id] -= DT;
+        }
+
+
+        // ----------------------------------------------------
+        // BOTTOM  (transverse, face at z+1)
+        // ----------------------------------------------------
+
+        if (z == uint(cells_z - 1))
+        {
+            // Face lies on the z = cells_z wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muB = 0.25 * (
+                mu_eff[muIndex(x - 1u, y, z)] +
+                mu_eff[muIndex(x,      y, z)] +
+                mu_eff[muIndex(x - 1u, y, z + 1u)] +
+                mu_eff[muIndex(x,      y, z + 1u)]
+            );
+
+            float DB = muB * area_z / dz;
+
+            aP[id] += DB;
+            aB[id] -= DB;
+        }
+    }
+
+
+    // ========================================================
+    // YFACE / v
+    //
+    // v grid:
+    //
+    //     cells_x
+    //     × (cells_y + 1)
+    //     × cells_z
+    //
+    // N/S are normal to the v CV -> ONE cell (factor two).
+    //
+    // W/E/T/B are transverse -> FOUR cells.
+    // ========================================================
+
+    else if (topology == 2)
+    {
+        // ----------------------------------------------------
+        // Wall-normal DOF -> Dirichlet, nothing assembled.
+        // ----------------------------------------------------
+
+        if (y == 0u ||
+            y == uint(cells_y))
+        {
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // NORTH / SOUTH  (normal direction, always interior)
+        //
+        // N face at y-1/2 -> cell (x, y-1, z)
+        // S face at y+1/2 -> cell (x, y,   z)
+        // ----------------------------------------------------
+
+        float muN = 2.0 * mu_eff[muIndex(x, y - 1u, z)];
+        float muS = 2.0 * mu_eff[muIndex(x, y,      z)];
+
+        float DN = muN * area_y / dy;
+        float DS = muS * area_y / dy;
+
+        aP[id] += DN + DS;
+
+        aN[id] -= DN;
+        aS[id] -= DS;
+
+
+        // ----------------------------------------------------
+        // WEST  (transverse, face at x)
+        // ----------------------------------------------------
+
+        if (x == 0u)
+        {
+            // Face lies on the x = 0 wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muW = 0.25 * (
+                mu_eff[muIndex(x - 1u, y - 1u, z)] +
+                mu_eff[muIndex(x - 1u, y,      z)] +
+                mu_eff[muIndex(x,      y - 1u, z)] +
+                mu_eff[muIndex(x,      y,      z)]
+            );
+
+            float DW = muW * area_x / dx;
+
+            aP[id] += DW;
+            aW[id] -= DW;
+        }
+
+
+        // ----------------------------------------------------
+        // EAST  (transverse, face at x+1)
+        // ----------------------------------------------------
+
+        if (x == uint(cells_x - 1))
+        {
+            // Face lies on the x = cells_x wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muE = 0.25 * (
+                mu_eff[muIndex(x,      y - 1u, z)] +
+                mu_eff[muIndex(x + 1u, y - 1u, z)] +
+                mu_eff[muIndex(x,      y,      z)] +
+                mu_eff[muIndex(x + 1u, y,      z)]
+            );
+
+            float DE = muE * area_x / dx;
+
+            aP[id] += DE;
+            aE[id] -= DE;
+        }
+
+
+        // ----------------------------------------------------
+        // TOP  (transverse, face at z)
+        // ----------------------------------------------------
+
+        if (z == 0u)
+        {
+            // Face lies on the z = 0 wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muT = 0.25 * (
+                mu_eff[muIndex(x, y - 1u, z - 1u)] +
+                mu_eff[muIndex(x, y,      z - 1u)] +
+                mu_eff[muIndex(x, y - 1u, z)] +
+                mu_eff[muIndex(x, y,      z)]
+            );
+
+            float DT = muT * area_z / dz;
+
+            aP[id] += DT;
+            aT[id] -= DT;
+        }
+
+
+        // ----------------------------------------------------
+        // BOTTOM  (transverse, face at z+1)
+        // ----------------------------------------------------
+
+        if (z == uint(cells_z - 1))
+        {
+            // Face lies on the z = cells_z wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muB = 0.25 * (
+                mu_eff[muIndex(x, y - 1u, z)] +
+                mu_eff[muIndex(x, y,      z)] +
+                mu_eff[muIndex(x, y - 1u, z + 1u)] +
+                mu_eff[muIndex(x, y,      z + 1u)]
+            );
+
+            float DB = muB * area_z / dz;
+
+            aP[id] += DB;
+            aB[id] -= DB;
+        }
+    }
+
+
+    // ========================================================
+    // ZFACE / w
+    //
+    // w grid:
+    //
+    //     cells_x
+    //     × cells_y
+    //     × (cells_z + 1)
+    //
+    // T/B are normal to the w CV -> ONE cell (factor two).
+    //
+    // W/E/N/S are transverse -> FOUR cells.
+    // ========================================================
+
+    else
+    {
+        // topology == 3
+
+        // ----------------------------------------------------
+        // Wall-normal DOF -> Dirichlet, nothing assembled.
+        // ----------------------------------------------------
+
+        if (z == 0u ||
+            z == uint(cells_z))
+        {
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // TOP / BOTTOM  (normal direction, always interior)
+        //
+        // T face at z-1/2 -> cell (x, y, z-1)
+        // B face at z+1/2 -> cell (x, y, z)
+        // ----------------------------------------------------
+
+        float muT = 2.0 * mu_eff[muIndex(x, y, z - 1u)];
+        float muB = 2.0 * mu_eff[muIndex(x, y, z)];
+
+        float DT = muT * area_z / dz;
+        float DB = muB * area_z / dz;
+
+        aP[id] += DT + DB;
+
+        aT[id] -= DT;
+        aB[id] -= DB;
+
+
+        // ----------------------------------------------------
+        // WEST  (transverse, face at x)
+        // ----------------------------------------------------
+
+        if (x == 0u)
+        {
+            // Face lies on the x = 0 wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muW = 0.25 * (
+                mu_eff[muIndex(x - 1u, y, z - 1u)] +
+                mu_eff[muIndex(x - 1u, y, z)] +
+                mu_eff[muIndex(x,      y, z - 1u)] +
+                mu_eff[muIndex(x,      y, z)]
+            );
+
+            float DW = muW * area_x / dx;
+
+            aP[id] += DW;
+            aW[id] -= DW;
+        }
+
+
+        // ----------------------------------------------------
+        // EAST  (transverse, face at x+1)
+        // ----------------------------------------------------
+
+        if (x == uint(cells_x - 1))
+        {
+            // Face lies on the x = cells_x wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muE = 0.25 * (
+                mu_eff[muIndex(x,      y, z - 1u)] +
+                mu_eff[muIndex(x,      y, z)] +
+                mu_eff[muIndex(x + 1u, y, z - 1u)] +
+                mu_eff[muIndex(x + 1u, y, z)]
+            );
+
+            float DE = muE * area_x / dx;
+
+            aP[id] += DE;
+            aE[id] -= DE;
+        }
+
+
+        // ----------------------------------------------------
+        // NORTH  (transverse, face at y)
+        // ----------------------------------------------------
+
+        if (y == 0u)
+        {
+            // Face lies on the y = 0 wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muN = 0.25 * (
+                mu_eff[muIndex(x, y - 1u, z - 1u)] +
+                mu_eff[muIndex(x, y - 1u, z)] +
+                mu_eff[muIndex(x, y,      z - 1u)] +
+                mu_eff[muIndex(x, y,      z)]
+            );
+
+            float DN = muN * area_y / dy;
+
+            aP[id] += DN;
+            aN[id] -= DN;
+        }
+
+
+        // ----------------------------------------------------
+        // SOUTH  (transverse, face at y+1)
+        // ----------------------------------------------------
+
+        if (y == uint(cells_y - 1))
+        {
+            // Face lies on the y = cells_y wall: no viscous term here. The wall shear is added
+            // implicitly (aP only) by momentum_wall_contribution.comp, whose Spalding law
+            // already reduces to the laminar half-cell term mu*A/(delta/2) when y+ -> 0.
+        }
+        else
+        {
+            float muS = 0.25 * (
+                mu_eff[muIndex(x, y,      z - 1u)] +
+                mu_eff[muIndex(x, y,      z)] +
+                mu_eff[muIndex(x, y + 1u, z - 1u)] +
+                mu_eff[muIndex(x, y + 1u, z)]
+            );
+
+            float DS = muS * area_y / dy;
+
+            aP[id] += DS;
+            aS[id] -= DS;
+        }
+    }
+}

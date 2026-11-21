@@ -1,0 +1,60 @@
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(std430, binding = 0) writeonly buffer WallDistanceField
+{
+    float wall_distance[];
+};
+
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    uint j = gl_GlobalInvocationID.y;
+    uint k = gl_GlobalInvocationID.z;
+
+    if (i >= grid_x || j >= grid_y || k >= grid_z)
+        return;
+
+    // Cell-centroid coordinates, assuming the domain begins at (0, 0, 0).
+    float x = (float(i) + 0.5) * dx;
+    float y = (float(j) + 0.5) * dy;
+    float z = (float(k) + 0.5) * dz;
+
+    // Domain dimensions.
+    float Lx = float(grid_x) * dx;
+    float Ly = float(grid_y) * dy;
+    float Lz = float(grid_z) * dz;
+
+    // Distances to the six outer walls.
+    float d_x_min = x;
+    float d_x_max = Lx - x;
+
+    float d_y_min = y;
+    float d_y_max = Ly - y;
+
+    float d_z_min = z;
+    float d_z_max = Lz - z;
+
+    // Minimum distance to any of the six walls.
+    float d_wall = min(
+        min(d_x_min, d_x_max),
+        min(
+            min(d_y_min, d_y_max),
+            min(d_z_min, d_z_max)
+        )
+    );
+
+    // Cell-centred, x-fastest linear indexing.
+    uint index = i + grid_x * (j + grid_y * k);
+
+    wall_distance[index] = d_wall;
+}

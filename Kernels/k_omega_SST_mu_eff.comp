@@ -1,0 +1,422 @@
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+uniform float dynamic_viscosity;
+uniform float density;
+
+const float beta_star = 0.09;
+const float a1 = 0.31;
+
+layout(std430, binding = 0) readonly buffer UVelocity
+{
+    float u[];
+};
+
+layout(std430, binding = 1) readonly buffer VVelocity
+{
+    float v[];
+};
+
+layout(std430, binding = 2) readonly buffer WVelocity
+{
+    float w[];
+};
+
+layout(std430, binding = 3) buffer EffectiveViscosity
+{
+    float mu_eff[];
+};
+
+layout(std430, binding = 4) buffer K
+{
+    float k[];
+};
+
+layout(std430, binding = 5) buffer Omega
+{
+    float omega[];
+};
+
+layout(std430, binding = 6) buffer NEAR_WALL_DISTS
+{
+    float nearest_wall_dists[];
+};
+
+uint index_u(uint x, uint y, uint z)
+{
+    uint nx = grid_x + 1u;
+    return z * (nx * grid_y)
+         + y * nx
+         + x;
+}
+
+uint index_v(uint x, uint y, uint z)
+{
+    uint ny = grid_y + 1u;
+    return z * (grid_x * ny)
+         + y * grid_x
+         + x;
+}
+
+uint index_w(uint x, uint y, uint z)
+{
+    uint nz = grid_z + 1u;
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= grid_x || y >= grid_y || z >= grid_z)
+        return;
+
+    // Boundary cells are handled by the wall treatment.
+    if (x == 0u || x == grid_x - 1u ||
+        y == 0u || y == grid_y - 1u ||
+        z == 0u || z == grid_z - 1u)
+        return;
+
+
+    /*
+        ----------------------------------------------------
+        NORMAL GRADIENTS
+        ----------------------------------------------------
+    */
+
+    // du/dx
+    float u_E = u[index_u(x + 1u, y, z)];
+    float u_W = u[index_u(x,       y, z)];
+
+    float du_dx = (u_E - u_W) / dx;
+
+
+    // dv/dy
+    float v_S = v[index_v(x, y + 1u, z)];
+    float v_N = v[index_v(x, y,       z)];
+
+    float dv_dy = (v_S - v_N) / dy;
+
+
+    // dw/dz
+    float w_B = w[index_w(x, y, z + 1u)];
+    float w_T = w[index_w(x, y, z)];
+
+    float dw_dz = (w_B - w_T) / dz;
+
+
+    /*
+        ----------------------------------------------------
+        CROSS GRADIENTS
+        ----------------------------------------------------
+    */
+
+    // ====================================================
+    // du/dy
+    // ====================================================
+
+    // North location:
+    // First interpolate in y, then interpolate NW -> NE in x.
+
+    float u_NW =
+        0.5 * (
+            u[index_u(x, y - 1u, z)] +
+            u[index_u(x, y,      z)]
+        );
+
+    float u_NE =
+        0.5 * (
+            u[index_u(x + 1u, y - 1u, z)] +
+            u[index_u(x + 1u, y,      z)]
+        );
+
+    float u_N = 0.5 * (u_NW + u_NE);
+
+
+    // South location:
+
+    float u_SW =
+        0.5 * (
+            u[index_u(x, y,      z)] +
+            u[index_u(x, y + 1u, z)]
+        );
+
+    float u_SE =
+        0.5 * (
+            u[index_u(x + 1u, y,      z)] +
+            u[index_u(x + 1u, y + 1u, z)]
+        );
+
+    float u_S = 0.5 * (u_SW + u_SE);
+
+    float du_dy = (u_S - u_N) / dy;
+
+
+    // ====================================================
+    // du/dz
+    // ====================================================
+    // Top location:
+
+    float u_TW =
+        0.5 * (
+            u[index_u(x, y, z - 1u)] +
+            u[index_u(x, y, z)]
+        );
+
+    float u_TE =
+        0.5 * (
+            u[index_u(x + 1u, y, z - 1u)] +
+            u[index_u(x + 1u, y, z)]
+        );
+
+    float u_T = 0.5 * (u_TW + u_TE);
+
+
+    // Bottom location:
+
+    float u_BW =
+        0.5 * (
+            u[index_u(x, y, z)] +
+            u[index_u(x, y, z + 1u)]
+        );
+
+    float u_BE =
+        0.5 * (
+            u[index_u(x + 1u, y, z)] +
+            u[index_u(x + 1u, y, z + 1u)]
+        );
+
+    float u_B = 0.5 * (u_BW + u_BE);
+
+    float du_dz = (u_B - u_T) / dz;
+
+
+    // ====================================================
+    // dv/dx
+    // ====================================================
+
+    // West location:
+
+    float v_WN =
+        0.5 * (
+            v[index_v(x - 1u, y, z)] +
+            v[index_v(x - 1u, y + 1u, z)]
+        );
+
+    float v_WS =
+        0.5 * (
+            v[index_v(x, y, z)] +
+            v[index_v(x, y + 1u, z)]
+        );
+
+    float v_W = 0.5 * (v_WN + v_WS);
+
+
+    // East location:
+
+    float v_EN =
+        0.5 * (
+            v[index_v(x,     y, z)] +
+            v[index_v(x,     y + 1u, z)]
+        );
+
+    float v_ES =
+        0.5 * (
+            v[index_v(x + 1u, y, z)] +
+            v[index_v(x + 1u, y + 1u, z)]
+        );
+
+    float v_E = 0.5 * (v_EN + v_ES);
+
+    float dv_dx = (v_E - v_W) / dx;
+
+
+    // ====================================================
+    // dv/dz
+    // ====================================================
+
+    // Top location:
+
+    float v_NT =
+        0.5 * (
+            v[index_v(x, y, z - 1u)] +
+            v[index_v(x, y + 1u, z - 1u)]
+        );
+
+    float v_ST =
+        0.5 * (
+            v[index_v(x, y, z)] +
+            v[index_v(x, y + 1u, z)]
+        );
+
+    float v_T = 0.5 * (v_NT + v_ST);
+
+
+    // Bottom location:
+
+    float v_NB =
+        0.5 * (
+            v[index_v(x, y, z)] +
+            v[index_v(x, y + 1u, z)]
+        );
+
+    float v_SB =
+        0.5 * (
+            v[index_v(x, y, z + 1u)] +
+            v[index_v(x, y + 1u, z + 1u)]
+        );
+
+    float v_B = 0.5 * (v_NB + v_SB);
+
+    float dv_dz = (v_B - v_T) / dz;
+
+
+
+    // ====================================================
+    // dw/dx
+    // ====================================================
+
+    // West location:
+
+    float w_WT =
+        0.5 * (
+            w[index_w(x - 1u, y, z)] +
+            w[index_w(x - 1u, y, z + 1u)]
+        );
+
+    float w_WB =
+        0.5 * (
+            w[index_w(x, y, z)] +
+            w[index_w(x, y, z + 1u)]
+        );
+
+    float w_W = 0.5 * (w_WT + w_WB);
+
+
+    // East location:
+
+    float w_ET =
+        0.5 * (
+            w[index_w(x, y, z)] +
+            w[index_w(x, y, z + 1u)]
+        );
+
+    float w_EB =
+        0.5 * (
+            w[index_w(x + 1u, y, z)] +
+            w[index_w(x + 1u, y, z + 1u)]
+        );
+
+    float w_E = 0.5 * (w_ET + w_EB);
+
+    float dw_dx = (w_E - w_W) / dx;
+
+
+
+    // ====================================================
+    // dw/dy
+    // ====================================================
+    // North location:
+
+    float w_NT =
+        0.5 * (
+            w[index_w(x, y - 1u, z)] +
+            w[index_w(x, y - 1u, z + 1u)]
+        );
+
+    float w_NB =
+        0.5 * (
+            w[index_w(x, y, z)] +
+            w[index_w(x, y, z + 1u)]
+        );
+
+    float w_N = 0.5 * (w_NT + w_NB);
+
+
+    // South location:
+
+    float w_ST =
+        0.5 * (
+            w[index_w(x, y, z)] +
+            w[index_w(x, y, z + 1u)]
+        );
+
+    float w_SB =
+        0.5 * (
+            w[index_w(x, y + 1u, z)] +
+            w[index_w(x, y + 1u, z + 1u)]
+        );
+
+    float w_S = 0.5 * (w_ST + w_SB);
+
+    float dw_dy = (w_S - w_N) / dy;
+
+
+    /*
+        ----------------------------------------------------
+        STRAIN-RATE TENSOR
+        ----------------------------------------------------
+    */
+
+    float Sxx = du_dx;
+    float Syy = dv_dy;
+    float Szz = dw_dz;
+
+    float Sxy = 0.5 * (du_dy + dv_dx);
+    float Sxz = 0.5 * (du_dz + dw_dx);
+    float Syz = 0.5 * (dv_dz + dw_dy);
+
+
+    /*
+        Since S is symmetric:
+
+        Sij*Sij =
+            Sxx² + Syy² + Szz²
+          + 2(Sxy² + Sxz² + Syz²)
+    */
+
+    float strain_squared =
+          Sxx * Sxx
+        + Syy * Syy
+        + Szz * Szz
+        + 2.0 * (Sxy * Sxy + Sxz * Sxz + Syz * Syz);
+    
+    float S = sqrt(2.0 * strain_squared);
+
+    uint id = index_cell(x, y, z);
+
+    float nu = dynamic_viscosity / density;
+    float wall_dist = nearest_wall_dists[id];
+    float omega_value = max(omega[id], 0.0);
+    float k_value = max(k[id], 0.0);
+    float arg2 = max((2.0 * sqrt(k_value)) / (beta_star * wall_dist * omega_value + 1e-10), (500.0 * nu) / (wall_dist * wall_dist * omega_value + 1e-10)); //Numerical protection
+
+    float F2 = tanh(min(arg2 * arg2, 20.0));    //tanh(20) = 1 - 4.25 * (10 power - 18)       So a numerical protection
+
+    float denom = max(a1 * omega_value, S * F2);
+
+    float mu_t  = (denom > 1e-30) ? (density * a1 * k_value) / denom : 0.0;
+
+    mu_eff[id] = mu_t + dynamic_viscosity;
+}

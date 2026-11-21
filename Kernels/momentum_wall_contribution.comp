@@ -1,0 +1,550 @@
+#version 430 core
+
+layout(local_size_x = 8,
+       local_size_y = 8,
+       local_size_z = 8) in;
+
+// ============================================================
+// Momentum wall function (IMPLICIT, diagonal only)
+//
+// The wall shear on a tangential momentum DOF whose CV has a
+// face on a wall is
+//
+//     F = -tau_w * (U_c / |U_t|) * A,     tau_w = rho * u_tau^2
+//
+// which is linear in the DOF's own velocity U_c. Written with a
+// lagged coefficient it goes on the diagonal only:
+//
+//     aP += rho * u_tau^2 * A / |U_t|
+//
+// Same converged answer as an explicit RHS force, but the row
+// stays diagonally dominant at any dt.
+//
+// Laminar limit: as |U_t| -> 0 (or y+ -> 0) Spalding gives
+// u+ = y+, so rho*u_tau^2/|U_t| -> mu/y and the coefficient
+// becomes the plain half-cell no-slip term mu*A/(delta/2).
+// The viscous LHS kernel therefore adds NOTHING on wall faces.
+//
+// The SAME kernel builds the coarse multigrid operators: the
+// caller binds the coarse aP and the restricted u / v / w and
+// sets the coarse cells / spacing (only aP is ever written).
+//
+// topology:
+//   1 = XFACE / u
+//   2 = YFACE / v
+//   3 = ZFACE / w
+//
+// Run once for each momentum system, after the viscous LHS
+// assembly.
+// ============================================================
+
+layout(std430, binding = 0) buffer APBuffer
+{
+    float aP[];
+};
+
+layout(std430, binding = 1) readonly buffer UBuffer
+{
+    float u[];
+};
+
+layout(std430, binding = 2) readonly buffer VBuffer
+{
+    float v[];
+};
+
+layout(std430, binding = 3) readonly buffer WBuffer
+{
+    float w[];
+};
+
+// ============================================================
+// Grid and fluid properties
+// ============================================================
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+uniform float dynamic_viscosity;
+uniform float density;
+uniform float spalding_wall_smoothness;
+
+uniform int topology;
+
+const float kappa = 0.41;
+const float spalding_relative_tolerance = 1e-5;
+
+// ============================================================
+// Indexing — staggered layouts
+// ============================================================
+
+uint uIndex(uint x, uint y, uint z)
+{
+    uint nx = uint(cells_x + 1);
+
+    return z * (nx * uint(cells_y))
+         + y * nx
+         + x;
+}
+
+uint vIndex(uint x, uint y, uint z)
+{
+    uint ny = uint(cells_y + 1);
+
+    return z * (uint(cells_x) * ny)
+         + y * uint(cells_x)
+         + x;
+}
+
+uint wIndex(uint x, uint y, uint z)
+{
+    return z * (uint(cells_x) * uint(cells_y))
+         + y * uint(cells_x)
+         + x;
+}
+
+// ============================================================
+// Spalding wall law
+//
+// y+ = u+ + (1/B) * [exp(kappa*u+) - 1 - kappa*u+
+//                    - (kappa*u+)^2/2 - (kappa*u+)^3/6]
+//
+// local_Re = U_t * y / nu = u+ * y+
+// Solve local_Re/u+ = Spalding(u+) and recover u_tau = U_t/u+.
+// ============================================================
+
+float spalding_value(float u_plus)
+{
+    float inverse_B = 1.0 / spalding_wall_smoothness;
+    float ku = min(kappa * u_plus, 70.0);
+
+    return u_plus
+         + inverse_B * (
+               exp(ku)
+             - 1.0
+             - ku
+             - (ku * ku) / 2.0
+             - (ku * ku * ku) / 6.0
+           );
+}
+
+float SpaldingDerivative(float u_plus)
+{
+    float ku = min(kappa * u_plus, 70.0);
+
+    return 1.0
+         + (kappa / spalding_wall_smoothness)
+         * (
+               exp(ku)
+             - 1.0
+             - ku
+             - (ku * ku) / 2.0
+           );
+}
+
+float FDerivative(float u_plus, float local_Re)
+{
+    return -local_Re / (u_plus * u_plus)
+           - SpaldingDerivative(u_plus);
+}
+
+float calculate_u_tau(float Ut, float wall_distance)
+{
+    if (Ut <= 1e-8 ||
+        wall_distance <= 0.0 ||
+        density <= 0.0 ||
+        dynamic_viscosity <= 0.0 ||
+        spalding_wall_smoothness <= 0.0)
+    {
+        return 0.0;
+    }
+
+    float nu = dynamic_viscosity / density;
+    float local_Re = Ut * wall_distance / nu;
+
+    if (local_Re <= 0.0)
+        return 0.0;
+
+    float spalding_B = log(spalding_wall_smoothness) / kappa;
+
+    float u_plus;
+
+    if (local_Re < 121.0)
+    {
+        // Viscous-sublayer estimate.
+        u_plus = sqrt(local_Re);
+    }
+    else
+    {
+        // Log-law estimate for the initial guess.
+        u_plus = (1.0 / kappa) * log(max(local_Re, 1.0)) + spalding_B;
+    }
+
+    u_plus = max(u_plus, 1e-6);
+
+    float L = 0.8 * u_plus;
+    float R = 1.2 * u_plus;
+    float F_L = 0.0;
+    float F_R = 0.0;
+    bool bracket_found = false;
+
+    for (int iter = 0; iter < 30; ++iter)
+    {
+        F_L = (local_Re / L) - spalding_value(L);
+        F_R = (local_Re / R) - spalding_value(R);
+
+        if (F_L * F_R < 0.0)
+        {
+            bracket_found = true;
+            break;
+        }
+
+        L *= 0.5;
+        R *= 2.0;
+    }
+
+    // If no bracket is found, retain the initial estimate.
+    if (bracket_found)
+    {
+        for (int iter = 0; iter < 20; ++iter)
+        {
+            float current_F =
+                (local_Re / u_plus) - spalding_value(u_plus);
+
+            float dF = FDerivative(u_plus, local_Re);
+            float Newton_candidate = u_plus - current_F / dF;
+
+            if (Newton_candidate > L && Newton_candidate < R)
+                u_plus = Newton_candidate;
+            else
+                u_plus = 0.5 * (L + R);
+
+            float new_F =
+                (local_Re / u_plus) - spalding_value(u_plus);
+
+            if (abs(new_F) <
+                spalding_relative_tolerance *
+                max(local_Re / u_plus, 1e-8))
+            {
+                break;
+            }
+
+            if (F_L * new_F < 0.0)
+            {
+                R = u_plus;
+                F_R = new_F;
+            }
+            else
+            {
+                L = u_plus;
+                F_L = new_F;
+            }
+        }
+    }
+
+    return Ut / (u_plus + 1e-8);
+}
+
+// ============================================================
+// Implicit wall coefficient for one wall face
+//
+// aP contribution = tau_w * wall_area / |U_t|
+//                 = rho * u_tau^2 * wall_area / |U_t|
+//
+// |U_t| ~ 0 (fluid at rest, e.g. initial w = 0): the Spalding
+// limit u+ = y+ gives exactly mu * wall_area / wall_distance,
+// so no-slip is never lost.
+// ============================================================
+
+float wall_coefficient(
+    float Ut,
+    float wall_distance,
+    float wall_area)
+{
+    float laminar = dynamic_viscosity * wall_area / wall_distance;
+
+    if (Ut <= 1e-8)
+        return laminar;
+
+    float u_tau = calculate_u_tau(Ut, wall_distance);
+    float tau_w = density * u_tau * u_tau;
+
+    // Spalding has u+ <= y+, so the turbulent value is never below the laminar one
+    return max(tau_w * wall_area / Ut, laminar);
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    uint field_x;
+    uint field_y;
+    uint field_z;
+
+    if (topology == 1)             // XFACE / u
+    {
+        field_x = uint(cells_x + 1);
+        field_y = uint(cells_y);
+        field_z = uint(cells_z);
+    }
+    else if (topology == 2)        // YFACE / v
+    {
+        field_x = uint(cells_x);
+        field_y = uint(cells_y + 1);
+        field_z = uint(cells_z);
+    }
+    else if (topology == 3)        // ZFACE / w
+    {
+        field_x = uint(cells_x);
+        field_y = uint(cells_y);
+        field_z = uint(cells_z + 1);
+    }
+    else
+    {
+        return;
+    }
+
+    if (x >= field_x || y >= field_y || z >= field_z)
+        return;
+
+    uint id = z * (field_x * field_y) + y * field_x + x;
+
+    float area_x = dy * dz;
+    float area_y = dx * dz;
+    float area_z = dx * dy;
+
+    float wall_aP = 0.0;
+
+    // ========================================================
+    // XFACE / u
+    // ========================================================
+
+    if (topology == 1)
+    {
+        // u is wall-normal on x-min and x-max boundaries.
+        if (x == 0u || x == uint(cells_x))
+            return;
+
+        float u_t = u[id];
+
+        // y-min wall
+        if (y == 0u)
+        {
+            float w_t = 0.25 * (
+                w[wIndex(x - 1u, y, z)] +
+                w[wIndex(x,      y, z)] +
+                w[wIndex(x - 1u, y, z + 1u)] +
+                w[wIndex(x,      y, z + 1u)]
+            );
+
+            float Ut = sqrt(u_t * u_t + w_t * w_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dy, area_y);
+        }
+
+        // y-max wall
+        if (y == uint(cells_y - 1))
+        {
+            float w_t = 0.25 * (
+                w[wIndex(x - 1u, y, z)] +
+                w[wIndex(x,      y, z)] +
+                w[wIndex(x - 1u, y, z + 1u)] +
+                w[wIndex(x,      y, z + 1u)]
+            );
+
+            float Ut = sqrt(u_t * u_t + w_t * w_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dy, area_y);
+        }
+
+        // z-min wall
+        if (z == 0u)
+        {
+            float v_t = 0.25 * (
+                v[vIndex(x - 1u, y,      z)] +
+                v[vIndex(x,      y,      z)] +
+                v[vIndex(x - 1u, y + 1u, z)] +
+                v[vIndex(x,      y + 1u, z)]
+            );
+
+            float Ut = sqrt(u_t * u_t + v_t * v_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dz, area_z);
+        }
+
+        // z-max wall
+        if (z == uint(cells_z - 1))
+        {
+            float v_t = 0.25 * (
+                v[vIndex(x - 1u, y,      z)] +
+                v[vIndex(x,      y,      z)] +
+                v[vIndex(x - 1u, y + 1u, z)] +
+                v[vIndex(x,      y + 1u, z)]
+            );
+
+            float Ut = sqrt(u_t * u_t + v_t * v_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dz, area_z);
+        }
+    }
+
+    // ========================================================
+    // YFACE / v
+    // ========================================================
+
+    else if (topology == 2)
+    {
+        // v is wall-normal on y-min and y-max boundaries.
+        if (y == 0u || y == uint(cells_y))
+            return;
+
+        float v_t = v[id];
+
+        // x-min wall
+        if (x == 0u)
+        {
+            float w_t = 0.25 * (
+                w[wIndex(x, y - 1u, z)] +
+                w[wIndex(x, y,      z)] +
+                w[wIndex(x, y - 1u, z + 1u)] +
+                w[wIndex(x, y,      z + 1u)]
+            );
+
+            float Ut = sqrt(v_t * v_t + w_t * w_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dx, area_x);
+        }
+
+        // x-max wall
+        if (x == uint(cells_x - 1))
+        {
+            float w_t = 0.25 * (
+                w[wIndex(x, y - 1u, z)] +
+                w[wIndex(x, y,      z)] +
+                w[wIndex(x, y - 1u, z + 1u)] +
+                w[wIndex(x, y,      z + 1u)]
+            );
+
+            float Ut = sqrt(v_t * v_t + w_t * w_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dx, area_x);
+        }
+
+        // z-min wall
+        if (z == 0u)
+        {
+            float u_t = 0.25 * (
+                u[uIndex(x,     y - 1u, z)] +
+                u[uIndex(x + 1u, y - 1u, z)] +
+                u[uIndex(x,     y,      z)] +
+                u[uIndex(x + 1u, y,      z)]
+            );
+
+            float Ut = sqrt(v_t * v_t + u_t * u_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dz, area_z);
+        }
+
+        // z-max wall
+        if (z == uint(cells_z - 1))
+        {
+            float u_t = 0.25 * (
+                u[uIndex(x,     y - 1u, z)] +
+                u[uIndex(x + 1u, y - 1u, z)] +
+                u[uIndex(x,     y,      z)] +
+                u[uIndex(x + 1u, y,      z)]
+            );
+
+            float Ut = sqrt(v_t * v_t + u_t * u_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dz, area_z);
+        }
+    }
+
+    // ========================================================
+    // ZFACE / w
+    // ========================================================
+
+    else // topology == 3
+    {
+        // w is wall-normal on z-min and z-max boundaries.
+        if (z == 0u || z == uint(cells_z))
+            return;
+
+        float w_t = w[id];
+
+        // x-min wall
+        if (x == 0u)
+        {
+            float v_t = 0.25 * (
+                v[vIndex(x, y,      z - 1u)] +
+                v[vIndex(x, y + 1u, z - 1u)] +
+                v[vIndex(x, y,      z)] +
+                v[vIndex(x, y + 1u, z)]
+            );
+
+            float Ut = sqrt(w_t * w_t + v_t * v_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dx, area_x);
+        }
+
+        // x-max wall
+        if (x == uint(cells_x - 1))
+        {
+            float v_t = 0.25 * (
+                v[vIndex(x, y,      z - 1u)] +
+                v[vIndex(x, y + 1u, z - 1u)] +
+                v[vIndex(x, y,      z)] +
+                v[vIndex(x, y + 1u, z)]
+            );
+
+            float Ut = sqrt(w_t * w_t + v_t * v_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dx, area_x);
+        }
+
+        // y-min wall
+        if (y == 0u)
+        {
+            float u_t = 0.25 * (
+                u[uIndex(x,     y, z - 1u)] +
+                u[uIndex(x + 1u, y, z - 1u)] +
+                u[uIndex(x,     y, z)] +
+                u[uIndex(x + 1u, y, z)]
+            );
+
+            float Ut = sqrt(w_t * w_t + u_t * u_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dy, area_y);
+        }
+
+        // y-max wall
+        if (y == uint(cells_y - 1))
+        {
+            float u_t = 0.25 * (
+                u[uIndex(x,     y, z - 1u)] +
+                u[uIndex(x + 1u, y, z - 1u)] +
+                u[uIndex(x,     y, z)] +
+                u[uIndex(x + 1u, y, z)]
+            );
+
+            float Ut = sqrt(w_t * w_t + u_t * u_t);
+
+            wall_aP += wall_coefficient(Ut, 0.5 * dy, area_y);
+        }
+    }
+
+
+    aP[id] += wall_aP;
+}

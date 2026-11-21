@@ -1,0 +1,38 @@
+#version 430 core
+
+layout(local_size_x = 256) in;
+
+// ============================================================================================================================
+// POSITIVITY FLOOR FOR A TRANSPORTED SCALAR (k, omega, epsilon)          x = max(x, floor_value)
+//
+// Why it exists: the multigrid solves return values that are a few rounding errors away from zero with an arbitrary sign
+// (measured: |k| ~ 1e-14, |omega| ~ 1e-9 in cells where the exact answer is positive but ~1e-30). The turbulence kernels divide by
+// k and omega, so those values must never be negative or exactly zero when the next kernel reads them.
+//
+// NaN is deliberately NOT repaired:  the comparison below is false for NaN, so a NaN stays a NaN and the monitors still see it.
+// (GLSL max(NaN, floor) is allowed to return the floor, which would silently hide a real failure.)
+//
+// One thread per element. The launch is flattened over x and y so that very large grids do not hit the 65535 work group limit in x.
+// ============================================================================================================================
+
+layout(std430, binding = 0) buffer FieldBuffer
+{
+    float field[];
+};
+
+uniform uint element_count;
+uniform float floor_value;
+
+void main()
+{
+    uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint i = group * 256u + gl_LocalInvocationID.x;
+
+    if (i >= element_count)
+        return;
+
+    float v = field[i];
+
+    if (v < floor_value)
+        field[i] = floor_value;
+}

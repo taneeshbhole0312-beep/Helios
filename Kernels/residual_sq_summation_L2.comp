@@ -1,0 +1,73 @@
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;     // DON'T change
+
+layout(std430, binding = 0)
+buffer needs_to_be_summed_buffer
+{
+    float field[];
+};
+
+layout(std430, binding = 1)
+buffer Reduced_WG_Sum_Buffer
+{
+    float reduced_WG_sum_buffer[]; // this buffer should have EXACTLY WG number of elements to store, else this kernel won't work
+};
+
+uniform uint field_x;
+uniform uint field_y;
+uniform uint field_z;
+uniform bool squared_input;
+
+shared float wg_sum[512];
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    uint l_id = gl_LocalInvocationIndex;
+
+    float element = 0.0;
+
+    if(x < field_x && y < field_y && z < field_z)
+    {
+    uint layer_stride = field_x * field_y;
+
+    uint id = z * layer_stride + y * uint(field_x) + x;
+
+    element = field[id];
+    }
+
+    if(!squared_input)
+    {
+        wg_sum[l_id] = element * element;
+    }
+    else if(squared_input)
+    {   
+        wg_sum[l_id] = element;
+    }
+
+    barrier();
+
+    for (uint stride = 256; stride > 0; stride >>= 1)
+    {
+        if (l_id < stride)
+        {
+            wg_sum[l_id] += wg_sum[l_id + stride];
+        }
+
+        barrier();
+    }
+
+    if (l_id == 0)
+    {
+        uint flatGroup = gl_WorkGroupID.z * (gl_NumWorkGroups.x * gl_NumWorkGroups.y)
+                        + gl_WorkGroupID.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.x;
+
+        reduced_WG_sum_buffer[flatGroup] = wg_sum[0];
+    }
+}

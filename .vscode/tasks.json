@@ -1,0 +1,59 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Helios",
+            "type": "shell",
+
+            "command": "C:/msys64/ucrt64/bin/g++.exe",
+
+            "args": [
+                "main.cpp",
+
+                "shader_manager/shader_manager.cpp",
+                "explicit_sim/explicit_sim.cpp",
+                "Incompressible_flow/incompressible_flow.cpp",
+                "Generic_multigrid/generic_multigrid.cpp",
+                "Renderer/visualization.cpp",
+                "Debuggers/debuggers.cpp",
+                "orchestrator/orchestrator.cpp",
+                "Linear_systems/LinearSystem.cpp",
+                "Linear_systems/multigrid_hierarchy.cpp",
+                "Turbulence_models/RANS.cpp",
+                "Turbulence_models/k_TurbulenceModel.cpp",
+                
+
+                "-o",
+                "main.exe",
+
+                "C:/GLAD/src/glad.c",
+
+                "-IC:/GLAD/include",
+                "-IC:/GLFW-3.5.1/glfw-3.5.1.bin.WIN64/include",
+
+                "-LC:/GLFW-3.5.1/glfw-3.5.1.bin.WIN64/lib-mingw-w64",
+
+                "-lglfw3",
+
+                "-fopenmp",
+
+                "-lopengl32",
+                "-lgdi32",
+                "-lwinmm",
+
+                "-static",
+                "-static-libgcc",
+                "-static-libstdc++"
+            ],
+
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+
+            "problemMatcher": [
+                "$gcc"
+            ]
+        }
+    ]
+}

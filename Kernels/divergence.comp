@@ -1,0 +1,70 @@
+#version 430 core
+
+layout(local_size_x = 8,
+       local_size_y = 8,
+       local_size_z = 8) in;
+
+layout(std430, binding = 0)
+buffer DivergenceBuffer
+{
+    float divergence[];
+};
+
+layout(std430, binding = 1)
+buffer VxBuffer
+{
+    float MAC_vx[];
+};
+
+layout(std430, binding = 2)
+buffer VyBuffer
+{
+    float MAC_vy[];
+};
+
+layout(std430, binding = 3)
+buffer VzBuffer
+{
+    float MAC_vz[];
+};
+
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+uniform float cell_side_x;
+uniform float cell_side_y;
+uniform float cell_side_z;
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= cells_x || y >= cells_y || z >= cells_z)
+    {
+        return;
+    }
+
+    uint idx = z * (cells_x * cells_y) + y * cells_x + x;
+
+    uint vx_idx = z * ((cells_x + 1) * cells_y) + y * (cells_x + 1) + x;
+    uint vy_idx = z * ((cells_y + 1) * cells_x) + y * cells_x + x;
+    uint vz_idx = z * (cells_x * cells_y) + y * cells_x + x;
+
+    float vx_west = MAC_vx[vx_idx];
+    float vx_east = MAC_vx[vx_idx + 1];          // we have cells x number of cells but cells x + 1 number of vx faces
+
+    float vy_north = MAC_vy[vy_idx];
+    float vy_south = MAC_vy[vy_idx + cells_x];    // we have cells y number of cells but cells y + 1 number of vy faces
+
+    float vz_top = MAC_vz[vz_idx];
+    float vz_bottom = MAC_vz[vz_idx + (cells_x * cells_y)];    // we have cells z number of cells but cells z + 1 number of vz faces
+
+    float inv_dx = 1.0 / cell_side_x;
+    float inv_dy = 1.0 / cell_side_y;
+    float inv_dz = 1.0 / cell_side_z;
+
+    divergence[idx] = (vx_east - vx_west) * inv_dx + (vy_south - vy_north) * inv_dy + (vz_bottom - vz_top) * inv_dz;
+}

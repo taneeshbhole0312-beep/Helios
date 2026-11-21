@@ -1,0 +1,75 @@
+#version 430 core
+
+layout( local_size_x = 8,
+        local_size_y = 8,
+        local_size_z = 8) in;
+
+
+// ============================================================
+// mu_t   = rho * C_mu * k^2 / eps
+// mu_eff = mu + mu_t
+//
+// Every cell, wall cells included (their k / eps come from the
+// wall treatment).
+// ============================================================
+
+// Cell-centered grid dimensions
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+
+// Fluid properties
+uniform float dynamic_viscosity;
+uniform float density;
+
+const float C_mu = 0.09;
+
+
+// Cell-centered k
+layout(std430, binding = 0) readonly buffer KField
+{
+    float k[];
+};
+
+// Cell-centered epsilon
+layout(std430, binding = 1) readonly buffer EpsilonField
+{
+    float eps[];
+};
+
+// Cell-centered effective viscosity (output)
+layout(std430, binding = 2) writeonly buffer EffectiveViscosity
+{
+    float mu_eff[];
+};
+
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= grid_x || y >= grid_y || z >= grid_z)
+        return;
+
+    uint id = index_cell(x, y, z);
+
+    // A negative k would still give a positive k^2, so it is clipped to zero (mu_t = 0) rather than squared.
+    float k_positive = max(k[id], 0.0);
+
+    // Same FLT_MIN guard as the eps source kernel: k = eps = 0 gives mu_t = 0 instead of 0 / 0.
+    float eps_safe = max(eps[id], 0.0) + 1.17549435e-38;
+
+    float mu_t = density * C_mu * (k_positive * k_positive) / eps_safe;
+
+    mu_eff[id] = dynamic_viscosity + mu_t;
+}

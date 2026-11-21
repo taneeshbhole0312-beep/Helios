@@ -1,0 +1,86 @@
+#version 430 core
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) 
+buffer MACVBuffer 
+{ 
+    float MAC_v[]; 
+};
+layout(std430, binding = 1) 
+buffer MACHBuffer 
+{ 
+    float MAC_h[]; 
+};
+
+uniform int cells_x;
+uniform int cells_y;
+uniform float cell_side_x;
+uniform float cell_side_y;
+
+uniform float mouse_x;
+uniform float mouse_y;
+uniform float mouse_dx;
+uniform float mouse_dy;
+uniform float radius;
+uniform float strength;
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+
+    float r2 = radius * radius;
+
+    // --- VX faces: (cells_x + 1) * cells_y
+    uint vx_total = uint((cells_x + 1) * cells_y);
+    if (idx < vx_total)
+    {
+        int face_x = int(idx) % (cells_x + 1);
+        int face_y = int(idx) / (cells_x + 1);
+
+        float fx = float(face_x) * cell_side_x;
+        float fy = float(face_y) * cell_side_y + 0.5 * cell_side_y;
+
+        float dx = fx - mouse_x;
+        float dy = fy - mouse_y;
+        float dist2 = dx*dx + dy*dy;
+
+        if (dist2 <= r2)
+        {
+            float falloff = exp(-dist2 / (2.0 * r2));
+            MAC_v[idx] += mouse_dx * strength * falloff;
+            
+            if (face_x == 0u || face_x == uint(cells_x))
+            {
+                MAC_v[idx] = 0.0;
+            }
+
+        }
+    }
+
+    // --- VY faces: cells_x * (cells_y + 1)
+    uint vy_total = uint(cells_x * (cells_y + 1));
+    if (idx < vy_total)
+    {
+        int face_x = int(idx) % cells_x;
+        int face_y = int(idx) / cells_x;
+
+        float fx = float(face_x) * cell_side_x + 0.5 * cell_side_x;
+        float fy = float(face_y) * cell_side_y;
+
+        float dx = fx - mouse_x;
+        float dy = fy - mouse_y;
+        float dist2 = dx*dx + dy*dy;
+
+        if (dist2 <= r2)
+        {
+            float falloff = exp(-dist2 / (2.0 * r2));
+            MAC_h[idx] += mouse_dy * strength * falloff;
+            if (face_y == 0u || face_y == uint(cells_y))
+            {
+                MAC_h[idx] = 0.0;
+            }
+
+        }
+    }
+}

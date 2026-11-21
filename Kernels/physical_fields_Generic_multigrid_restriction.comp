@@ -1,0 +1,185 @@
+//=================================================================================================================================
+// PHYSICAL FIELD RESTRICTION (velocities, mu_eff, k, epsilon / omega, and the pressure residual density), any fine / coarse ratio
+//
+// A physical field is a point / average VALUE, not an integrated quantity, so it is restricted as a weighted AVERAGE
+// (contrast with multigrid_residual_generic_restriction.comp, which sums integrated residuals).
+//
+// Lengths are measured in units of ONE FINE CELL.
+//
+//  CELL_CENTERED : volume average over the coarse cell,  value_c = sum_f l_x l_y l_z value_f / sum_f l_x l_y l_z
+//                  (l = overlap length of the fine cell with the coarse cell)
+//
+//  FACE_CENTERED : a face value stands for the flux-carrying value ON the face plane, so
+//                  - along the face normal the fine field is linearly interpolated to the plane of the coarse face,
+//                  - over the face area (the two tangential axes) it is area averaged with the cell overlap weights above.
+//                  For an exact 2:1 ratio the coarse face plane coincides with a fine face plane and this reduces to the old
+//                  "average of the 2 x 2 fine faces in that plane", which keeps the coarse flux equal to the fine flux.
+//=================================================================================================================================
+
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Fine-grid field
+layout(std430, binding = 0) readonly buffer FineField
+{
+    float fineField[];
+};
+
+// Coarse-grid field
+layout(std430, binding = 1) writeonly buffer CoarseField
+{
+    float coarseField[];
+};
+
+// Number of elements (DOFs) in each dimension
+uniform ivec3 fineDimensions;
+uniform ivec3 coarseDimensions;
+
+// 0 = CELL_CENTERED
+// 1 = XFACE_CENTERED
+// 2 = YFACE_CENTERED
+// 3 = ZFACE_CENTERED
+uniform int topology;
+
+
+// ------------------------------------------------------------
+// Flatten 3D index
+// ------------------------------------------------------------
+uint index3D(ivec3 p, ivec3 dimensions)
+{
+    return uint(
+        p.x +
+        p.y * dimensions.x +
+        p.z * dimensions.x * dimensions.y
+    );
+}
+
+// Cell counts of a level: a face-centered field has one more DOF than cells along its normal axis
+ivec3 cellCounts(ivec3 dimensions)
+{
+    ivec3 cells = dimensions;
+
+    if (topology == 1) cells.x -= 1;
+    else if (topology == 2) cells.y -= 1;
+    else if (topology == 3) cells.z -= 1;
+
+    return cells;
+}
+
+// A position in fine-cell units = numerator / denominator, kept as an exact whole part plus a fraction in [0, 1)
+// (precision independent of the distance from the origin; shared boundaries are bit-identical from both sides)
+struct Coordinate
+{
+    int whole;
+    float frac;
+};
+
+Coordinate makeCoordinate(int numerator, int denominator)        // numerator >= 0, denominator > 0
+{
+    Coordinate c;
+    c.whole = numerator / denominator;
+    c.frac = float(numerator - c.whole * denominator) / float(denominator);
+    return c;
+}
+
+// Length of [lo, hi) inside the fine cell [i, i + 1)
+float overlap(Coordinate lo, Coordinate hi, int i)
+{
+    float lo_local = float(lo.whole - i) + lo.frac;
+    float hi_local = float(hi.whole - i) + hi.frac;
+
+    return max(0.0, min(hi_local, 1.0) - max(lo_local, 0.0));
+}
+
+
+void main()
+{
+    ivec3 coarseID = ivec3(gl_GlobalInvocationID.xyz);
+
+    // Don't process threads outside the coarse field.
+    if (coarseID.x >= coarseDimensions.x ||
+        coarseID.y >= coarseDimensions.y ||
+        coarseID.z >= coarseDimensions.z)
+    {
+        return;
+    }
+
+    uint coarseIndex = index3D(coarseID, coarseDimensions);
+
+    int normal_axis = topology - 1;         // -1 for a cell-centered field
+
+    ivec3 fineCells = cellCounts(fineDimensions);
+    ivec3 coarseCells = cellCounts(coarseDimensions);
+
+    // per axis: the fine DOF range [first, last] and how each one is weighted
+    //   cell axis   -> overlap of [lo, hi) with the fine cell
+    //   normal axis -> linear interpolation weights (1 - t, t) of the two fine faces around the coarse face plane
+    Coordinate lo[3];
+    Coordinate hi[3];
+    ivec3 first;
+    ivec3 last;
+    float t_normal = 0.0;
+
+    for (int axis = 0; axis < 3; axis++)
+    {
+        int I = coarseID[axis];
+        int Nf = fineCells[axis];
+        int Nc = coarseCells[axis];
+
+        if (axis == normal_axis)
+        {
+            Coordinate plane = makeCoordinate(I * Nf, Nc);          // coarse face plane I r, in fine-face index units
+
+            first[axis] = min(plane.whole, fineDimensions[axis] - 1);
+            last[axis]  = min(first[axis] + 1, fineDimensions[axis] - 1);
+            t_normal    = plane.frac;
+        }
+        else
+        {
+            lo[axis] = makeCoordinate(I * Nf, Nc);                  // I r
+            hi[axis] = makeCoordinate((I + 1) * Nf, Nc);            // (I + 1) r
+
+            first[axis] = max(lo[axis].whole, 0);
+            last[axis]  = min((hi[axis].frac > 0.0) ? hi[axis].whole : hi[axis].whole - 1, fineDimensions[axis] - 1);     // ceil(hi) - 1
+        }
+    }
+
+    float weighted_sum = 0.0;
+    float weight_sum = 0.0;
+
+    for (int k = first.z; k <= last.z; ++k)
+    {
+        for (int j = first.y; j <= last.y; ++j)
+        {
+            for (int i = first.x; i <= last.x; ++i)
+            {
+                ivec3 fineID = ivec3(i, j, k);
+
+                float w = 1.0;
+
+                for (int axis = 0; axis < 3; axis++)
+                {
+                    if (axis == normal_axis)
+                    {
+                        // single sample when the plane sits on the last fine face (first == last)
+                        if (first[axis] != last[axis])
+                            w *= (fineID[axis] == first[axis]) ? (1.0 - t_normal) : t_normal;
+                    }
+                    else
+                    {
+                        w *= overlap(lo[axis], hi[axis], fineID[axis]);
+                    }
+                }
+
+                if (w > 0.0)
+                {
+                    weighted_sum += w * fineField[index3D(fineID, fineDimensions)];
+                    weight_sum += w;
+                }
+            }
+        }
+    }
+
+    coarseField[coarseIndex] = weighted_sum / weight_sum;
+}

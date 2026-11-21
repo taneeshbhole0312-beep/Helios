@@ -1,0 +1,70 @@
+#version 430 core
+
+// FIRST reduction pass of sum((new - old)^2).
+// Same work-group layout and output convention as residual_sq_summation_L2.comp, so every later
+// pass is done by that kernel with squared_input = true (plain summation, no re-squaring).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;     // DON'T change (must match residual_sq_summation_L2.comp)
+
+layout(std430, binding = 0) readonly buffer NewIterate
+{
+    float new_iterate[];
+};
+
+layout(std430, binding = 1) readonly buffer OldIterate
+{
+    float old_iterate[];
+};
+
+layout(std430, binding = 2) writeonly buffer Reduced_WG_Sum_Buffer
+{
+    float reduced_WG_sum_buffer[];      // one element per work group
+};
+
+uniform uint field_x;
+uniform uint field_y;
+uniform uint field_z;
+
+shared float wg_sum[512];
+
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    uint l_id = gl_LocalInvocationIndex;
+
+    float difference = 0.0;
+
+    if (x < field_x && y < field_y && z < field_z)
+    {
+        uint id = z * (field_x * field_y) + y * field_x + x;
+
+        difference = new_iterate[id] - old_iterate[id];
+    }
+
+    wg_sum[l_id] = difference * difference;
+
+    barrier();
+
+    for (uint stride = 256; stride > 0; stride >>= 1)
+    {
+        if (l_id < stride)
+        {
+            wg_sum[l_id] += wg_sum[l_id + stride];
+        }
+
+        barrier();
+    }
+
+    if (l_id == 0)
+    {
+        uint flatGroup = gl_WorkGroupID.z * (gl_NumWorkGroups.x * gl_NumWorkGroups.y)
+                        + gl_WorkGroupID.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.x;
+
+        reduced_WG_sum_buffer[flatGroup] = wg_sum[0];
+    }
+}

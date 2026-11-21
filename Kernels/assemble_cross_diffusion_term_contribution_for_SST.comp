@@ -1,0 +1,107 @@
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+
+
+layout(std430, binding = 0) buffer RHS_OMEGA
+{
+    float RHS_omega[];
+};
+
+layout(std430, binding = 1) buffer Omega
+{
+    float omega[];
+};
+
+layout(std430, binding = 2) buffer K
+{
+    float k[];
+};
+
+layout(std430, binding = 3) buffer F1_VALUES_FIELD
+{
+    float blended_coefficient[];
+};
+
+uniform float density;
+uniform float omega_min;        // floor of the omega that DIVIDES the source, see the note at the division below
+uniform uint grid_x;
+uniform uint grid_y;
+uniform uint grid_z;
+uniform float dx;
+uniform float dy;
+uniform float dz;
+
+const float sigma_omega_2 = 0.856;
+
+uint index_cell(uint x, uint y, uint z)
+{
+    return z * (grid_x * grid_y)
+         + y * grid_x
+         + x;
+}
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x >= grid_x || y >= grid_y || z >= grid_z)
+        return;
+
+    // Boundary cells are handled by the wall treatment.
+    if (x == 0u || x == grid_x - 1u ||
+        y == 0u || y == grid_y - 1u ||
+        z == 0u || z == grid_z - 1u)
+        return;
+
+
+    uint index = index_cell(x, y, z);
+
+    uint stride_x = 1;
+    uint stride_y = grid_x;
+    uint stride_z = grid_x * grid_y;
+
+    vec3 grad_k;
+    vec3 grad_omega;
+
+    // X derivatives
+    grad_k.x = (k[index + stride_x] -
+                k[index - stride_x]) / (2.0 * dx);
+
+    grad_omega.x = (omega[index + stride_x] -
+                    omega[index - stride_x]) / (2.0 * dx);
+
+    // Y derivatives
+    grad_k.y = (k[index + stride_y] -
+                k[index - stride_y]) / (2.0 * dy);
+
+    grad_omega.y = (omega[index + stride_y] -
+                    omega[index - stride_y]) / (2.0 * dy);
+
+    // Z derivatives
+    grad_k.z = (k[index + stride_z] -
+                k[index - stride_z]) / (2.0 * dz);
+
+    grad_omega.z = (omega[index + stride_z] -
+                    omega[index - stride_z]) / (2.0 * dz);
+
+    
+    float dot_grad_k_grad_omega = (grad_k.x * grad_omega.x) + (grad_k.y * grad_omega.y) + (grad_k.z * grad_omega.z);
+
+    // THE FLOOR. The source is  (1 - F1) 2 rho sigma_w2 / omega * grad(k).grad(omega)  and is added explicitly (lagged iterate), so the
+    // factor 1/omega is the gain of a feedback loop: omega -> grad(omega) -> source -> omega. Where k and omega are both ~0 (zero or very
+    // low freestream turbulence) 1/omega is astronomically large and the loop diverges. omega_min = c U_ref / L_ref (set on the CPU)
+    // caps that gain. It is only used in this denominator, it is never written into the omega field.
+    // The 1e-12 is a hard guard so an unset uniform (0) can never divide by zero.
+    float omega_value = max(omega[index], max(omega_min, 1e-12));
+
+    float CD_k_omega = (2.0 * density * sigma_omega_2 * (1.0 / omega_value) * dot_grad_k_grad_omega);
+    
+    float P_omega_CD = (1.0 - blended_coefficient[index]) * CD_k_omega;
+
+    float volume = dx * dy * dz;
+    RHS_omega[index] += P_omega_CD * volume;
+}

@@ -1,0 +1,80 @@
+#version 430 core
+
+layout(local_size_x = 8,
+       local_size_y = 8,
+       local_size_z = 8) in;
+
+layout(std430, binding = 0)
+buffer VxBuffer
+{
+    float vx[];
+};
+
+layout(std430, binding = 1)
+buffer writeonly VxOutBuffer
+{
+    float vx_out[];
+};
+
+uniform int cells_x;
+uniform int cells_y;
+uniform int cells_z;
+
+uniform float dynamic_viscosity;
+uniform float density;
+uniform float stable_dt;
+uniform float cell_side_x;
+uniform float cell_side_y;
+uniform float cell_side_z;
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    if (x > cells_x || y >= cells_y || z >= cells_z)
+        return;
+
+    uint idx = z * ((cells_x + 1) * cells_y) + y * (cells_x + 1) + x;
+
+    float vx_west =
+        (x > 0)
+        ? vx[idx - 1]
+        : vx[idx];
+
+    float vx_east =
+        (x < cells_x)
+        ? vx[idx + 1]
+        : vx[idx];
+
+    float vx_north =
+        (y > 0)
+        ? vx[idx - (cells_x + 1)]
+        : vx[idx];
+
+    float vx_south =
+        (y < cells_y - 1)
+        ? vx[idx + (cells_x + 1)]
+        : vx[idx];
+
+    float vx_top =
+        (z > 0)
+        ? vx[idx - ((cells_x + 1) * cells_y)]
+        : vx[idx];
+
+    float vx_down =
+        (z < cells_z - 1)
+        ? vx[idx + ((cells_x + 1) * cells_y)]
+        : vx[idx];
+
+    float inv_dx2 = 1.0 / (cell_side_x * cell_side_x);
+    float inv_dy2 = 1.0 / (cell_side_y * cell_side_y);
+    float inv_dz2 = 1.0 / (cell_side_z * cell_side_z);
+
+    float laplacian = (vx_east - 2.0 * vx[idx] + vx_west) * inv_dx2 + (vx_north - 2.0 * vx[idx] + vx_south) * inv_dy2 + (vx_top - 2.0 * vx[idx] + vx_down) * inv_dz2;
+
+    float kinematic_viscosity = dynamic_viscosity / density;
+
+    vx_out[idx] = vx[idx] + kinematic_viscosity * stable_dt * laplacian;
+}
