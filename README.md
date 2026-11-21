@@ -76,67 +76,39 @@ Some implementations are experimental, incomplete or undergoing validation. The 
 
 --------------------------------Road Map Of Helios---------------------------------
 1. CFD Solver Validation and Refinement
-
 Thoroughly validate existing k-epsilon, k-omega and SST turbulence models.
-
 Validate solver accuracy, stability and convergence against established benchmarks.
-
-Improve multigrid performance and numerical robustness.
-
-Refine convection schemes, temporal discretization and boundary treatments.
-
+Adding boundary conditions such as any sized inlet or outlets to make the solver even more robust.
 Optimize GPU memory management and computational performance.
 
 2. Rigid Body Physics
-
 Develop a GPU-accelerated rigid body dynamics solver.
-
-Implement collision detection and collision response.
-
 Introduce contact mechanics and constraint handling.
-
 Develop interaction between rigid bodies and the existing simulation infrastructure.
 
 3. Multiphysics Coupling
-
 Couple rigid body dynamics with fluid simulations.
-
 Develop fluid-structure interaction capabilities.
-
 Establish a unified architecture for exchanging physical quantities between independent solvers.
-
 Expand towards more complex coupled physical systems.
 
 4. Rendering and Development Tools
-
-Significantly improve the simulation renderer and visualization pipeline.
-
 Develop advanced debugging and diagnostic tools.
-
 Introduce interactive visualization of simulation fields and physical quantities.
-
 Improve simulation inspection, profiling and post-processing workflows.
 
 5. Expansion into Additional Physics
-
 Deformable body mechanics and structural physics.
-
 Electromagnetic field simulation.
-
 Heat transfer and thermal-fluid coupling.
-
-Additional physical models and multiphysics interactions.
+and possibly more
 
 6. Unified Simulation Environment
-
 Develop an intuitive and accessible graphical interface.
-
-Integrate simulation setup, execution, visualization and debugging into a unified workflow.
-
-Improve scalability, extensibility and GPU utilization across all physics modules.
-
 Work towards making advanced multiphysics simulation accessible to inventors, researchers and engineers everywhere.
 
-This roadmap represents the long-term direction of Helios. Development priorities and implementation details may evolve as the project progresses.
+
+
+IMP: This roadmap represents the long-term direction of Helios. Development priorities and implementation details may evolve as the project progresses.
 
 
