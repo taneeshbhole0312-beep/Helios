@@ -556,14 +556,17 @@ void Orchestrator::run_rans_k_eps(float spalding_wall_smoothness, float referenc
 
             rans.construct_u_momentum_equation(dt_max, spalding_wall_smoothness); 
             int status_u = u_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float u_RMS_residual = u_solver.calculate_l2_norm() / sqrt((cells_x + 1) * cells_y * cells_z);
             // std::cout << "COMPLETED U SYSTEM LINEAR ITERATIONS WITH STATUS " << status_u << std::endl;
 
             rans.construct_v_momentum_equation(dt_max, spalding_wall_smoothness);
             int status_v = v_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float v_RMS_residual = v_solver.calculate_l2_norm() / sqrt((cells_y + 1) * cells_x * cells_z);
             // std::cout << "COMPLETED V SYSTEM LINEAR ITERATIONS WITH STATUS "<< status_v << std::endl;
             
             rans.construct_w_momentum_equation(dt_max, spalding_wall_smoothness);
             int status_w = w_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float w_RMS_residual = w_solver.calculate_l2_norm() / sqrt((cells_z + 1) * cells_y * cells_x);
             // std::cout << "COMPLETED W SYSTEM LINEAR ITERATIONS WITH STATUS "<< status_w << std::endl;
             
             incompressibility.divergence_cal(rans.u_system.field.data, rans.v_system.field.data, rans.w_system.field.data);
@@ -580,11 +583,13 @@ void Orchestrator::run_rans_k_eps(float spalding_wall_smoothness, float referenc
             k_model.construct_K_equation(dt_max, destruction_variable_model.destruction_variable_system.field.data, spalding_wall_smoothness);
             k_model.construct_K_equation_hierarchy(dt_max, destruction_variable_model.destruction_variable_hierarchy);
             int status_k = k_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float k_RMS_residual = k_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
             // std::cout << "SOLVED K SYSTEM WITH STATUS " << status_k << std::endl;
             
             destruction_variable_model.construct_destruction_variable_equation(dt_max, spalding_wall_smoothness);
             destruction_variable_model.construct_destruction_variable_equation_hierarchy(dt_max);
             int status_eps = eps_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float eps_RMS_residual = eps_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
             // std::cout << "SOLVED EPS SYSTEM WITH STATUS " << status_eps << std::endl;
             
             destruction_variable_model.update_mu_eff_k_eps();
@@ -592,11 +597,6 @@ void Orchestrator::run_rans_k_eps(float spalding_wall_smoothness, float referenc
 
             float max_non_linear_change = rans.calculate_nonlinear_convergence(k_model, destruction_variable_model);
 
-            float u_RMS_residual = u_solver.calculate_l2_norm() / sqrt((cells_x + 1) * cells_y * cells_z);
-            float v_RMS_residual = v_solver.calculate_l2_norm() / sqrt((cells_y + 1) * cells_x * cells_z);
-            float w_RMS_residual = w_solver.calculate_l2_norm() / sqrt((cells_z + 1) * cells_y * cells_x);
-            float k_RMS_residual = k_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
-            float eps_RMS_residual = eps_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
 
             RMS_of_u_system_residual_each_non_linear_iter += u_RMS_residual;
             RMS_of_v_system_residual_each_non_linear_iter += v_RMS_residual;
@@ -898,14 +898,17 @@ void Orchestrator::run_rans_k_omega(float spalding_wall_smoothness, float refere
 
             rans.construct_u_momentum_equation(dt_max, spalding_wall_smoothness);
             int status_u = u_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float u_RMS_residual = u_solver.calculate_l2_norm() / sqrt((cells_x + 1) * cells_y * cells_z);
             // std::cout << "COMPLETED U SYSTEM LINEAR ITERATIONS WITH STATUS " << status_u << std::endl;
 
             rans.construct_v_momentum_equation(dt_max, spalding_wall_smoothness);
             int status_v = v_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float v_RMS_residual = v_solver.calculate_l2_norm() / sqrt((cells_y + 1) * cells_x * cells_z);
             // std::cout << "COMPLETED V SYSTEM LINEAR ITERATIONS WITH STATUS "<< status_v << std::endl;
 
             rans.construct_w_momentum_equation(dt_max, spalding_wall_smoothness);
             int status_w = w_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float w_RMS_residual = w_solver.calculate_l2_norm() / sqrt((cells_z + 1) * cells_y * cells_x);
             // std::cout << "COMPLETED W SYSTEM LINEAR ITERATIONS WITH STATUS "<< status_w << std::endl;
 
             incompressibility.divergence_cal(rans.u_system.field.data, rans.v_system.field.data, rans.w_system.field.data);
@@ -922,11 +925,13 @@ void Orchestrator::run_rans_k_omega(float spalding_wall_smoothness, float refere
             k_model.construct_K_equation(dt_max, destruction_variable_model.destruction_variable_system.field.data, spalding_wall_smoothness);
             k_model.construct_K_equation_hierarchy(dt_max, destruction_variable_model.destruction_variable_hierarchy);
             int status_k = k_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float k_RMS_residual = k_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
             // std::cout << "SOLVED K SYSTEM WITH STATUS " << status_k << std::endl;
 
             destruction_variable_model.construct_destruction_variable_equation(dt_max, spalding_wall_smoothness);
             destruction_variable_model.construct_destruction_variable_equation_hierarchy(dt_max);
             int status_eps = omega_solver.multigrid_solve_system(1e-3, 1e-6, 3);
+            float omega_RMS_residual = omega_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
             // std::cout << "SOLVED OMEGA SYSTEM WITH STATUS " << status_eps << std::endl;
 
             destruction_variable_model.update_mu_eff_k_omega();
@@ -934,11 +939,6 @@ void Orchestrator::run_rans_k_omega(float spalding_wall_smoothness, float refere
 
             float max_non_linear_change = rans.calculate_nonlinear_convergence(k_model, destruction_variable_model);
 
-            float u_RMS_residual = u_solver.calculate_l2_norm() / sqrt((cells_x + 1) * cells_y * cells_z);
-            float v_RMS_residual = v_solver.calculate_l2_norm() / sqrt((cells_y + 1) * cells_x * cells_z);
-            float w_RMS_residual = w_solver.calculate_l2_norm() / sqrt((cells_z + 1) * cells_y * cells_x);
-            float k_RMS_residual = k_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
-            float omega_RMS_residual = omega_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
 
             RMS_of_u_system_residual_each_non_linear_iter += u_RMS_residual;
             RMS_of_v_system_residual_each_non_linear_iter += v_RMS_residual;
@@ -1274,15 +1274,21 @@ void Orchestrator::run_rans_k_omega_SST(float spalding_wall_smoothness, float re
             
             rans.construct_u_momentum_equation(dt_max, spalding_wall_smoothness);
             int status_u = u_solver.multigrid_solve_system(1e-3, 1e-4, 3);
-            // std::cout << "COMPLETED U SYSTEM LINEAR ITERATIONS WITH STATUS " << status_u << std::endl;
+            std::cout << "COMPLETED U SYSTEM LINEAR ITERATIONS WITH STATUS " << status_u << std::endl;
+            
+            float u_RMS_residual = u_solver.calculate_l2_norm() / sqrt((cells_x + 1) * cells_y * cells_z);
             
             rans.construct_v_momentum_equation(dt_max, spalding_wall_smoothness);
             int status_v = v_solver.multigrid_solve_system(1e-3, 1e-4, 3);
-            // std::cout << "COMPLETED V SYSTEM LINEAR ITERATIONS WITH STATUS "<< status_v << std::endl;
+            std::cout << "COMPLETED V SYSTEM LINEAR ITERATIONS WITH STATUS "<< status_v << std::endl;
+
+            float v_RMS_residual = v_solver.calculate_l2_norm() / sqrt((cells_y + 1) * cells_x * cells_z);
             
             rans.construct_w_momentum_equation(dt_max, spalding_wall_smoothness);
             int status_w = w_solver.multigrid_solve_system(1e-3, 1e-4, 3);
-            // std::cout << "COMPLETED W SYSTEM LINEAR ITERATIONS WITH STATUS "<< status_w << std::endl;
+            std::cout << "COMPLETED W SYSTEM LINEAR ITERATIONS WITH STATUS "<< status_w << std::endl;
+            
+            float w_RMS_residual = w_solver.calculate_l2_norm() / sqrt((cells_z + 1) * cells_y * cells_x);
 
             incompressibility.divergence_cal(rans.u_system.field.data, rans.v_system.field.data, rans.w_system.field.data);
             
@@ -1300,25 +1306,24 @@ void Orchestrator::run_rans_k_omega_SST(float spalding_wall_smoothness, float re
             k_model.construct_K_equation(dt_max, destruction_variable_model.destruction_variable_system.field.data, spalding_wall_smoothness);
             k_model.construct_K_equation_hierarchy(dt_max, destruction_variable_model.destruction_variable_hierarchy);
             int status_k = k_solver.multigrid_solve_system(1e-3, 1e-4, 3);
-            // std::cout << "SOLVED K SYSTEM WITH STATUS " << status_k << std::endl;
+            std::cout << "SOLVED K SYSTEM WITH STATUS " << status_k << std::endl;
             destruction_variable_model.enforce_positivity();        // SST: no negative / zero k reaches the omega assembly
+
+            float k_RMS_residual = k_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
 
             destruction_variable_model.construct_destruction_variable_equation(dt_max, spalding_wall_smoothness);
             destruction_variable_model.construct_destruction_variable_equation_hierarchy(dt_max);
             int status_eps = omega_solver.multigrid_solve_system(1e-3, 1e-4, 3);
-            // std::cout << "SOLVED OMEGA SYSTEM WITH STATUS " << status_eps << std::endl;
+            std::cout << "SOLVED OMEGA SYSTEM WITH STATUS " << status_eps << std::endl;
             destruction_variable_model.enforce_positivity();        // SST: no negative / zero omega reaches mu_eff, F1, the destruction term, or the coarse levels
+            
+            float omega_RMS_residual = omega_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
 
             destruction_variable_model.update_mu_eff_k_omega_SST();
             // std::cout << "UPDATED MU EFF" << std::endl;
 
             float max_non_linear_change = rans.calculate_nonlinear_convergence(k_model, destruction_variable_model);
-
-            float u_RMS_residual = u_solver.calculate_l2_norm() / sqrt((cells_x + 1) * cells_y * cells_z);
-            float v_RMS_residual = v_solver.calculate_l2_norm() / sqrt((cells_y + 1) * cells_x * cells_z);
-            float w_RMS_residual = w_solver.calculate_l2_norm() / sqrt((cells_z + 1) * cells_y * cells_x);
-            float k_RMS_residual = k_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
-            float omega_RMS_residual = omega_solver.calculate_l2_norm() / sqrt(cells_x * cells_y * cells_z);
+            
 
             RMS_of_u_system_residual_each_non_linear_iter += u_RMS_residual;
             RMS_of_v_system_residual_each_non_linear_iter += v_RMS_residual;
@@ -1354,7 +1359,7 @@ void Orchestrator::run_rans_k_omega_SST(float spalding_wall_smoothness, float re
                 break;
             }
 
-            // std::cout << "----------------------------------------------non linear iteration number = " << non_linear_iters << std::endl;
+            std::cout << "----------------------------------------------non linear iteration number = " << non_linear_iters << std::endl;
         }
 
         total_time_steps += 1;
@@ -1464,7 +1469,7 @@ void Orchestrator::run_rans_k_omega_SST(float spalding_wall_smoothness, float re
         
         std::cout  << total_time << " and real time is " << real_time << std::endl;
 
-        // std::cout << "-------------------------------------------TIME STEP COMPLETE----------------------------------------------" << std::endl;
+        std::cout << "-------------------------------------------TIME STEP COMPLETE----------------------------------------------" << std::endl;
 
         if(total_time >= config.simulation_needed_time)
             break;

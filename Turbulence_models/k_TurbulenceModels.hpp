@@ -31,18 +31,13 @@ class k_TurbulenceModels
                 std::vector <GLuint> blended_coefficient_hierarchy;
                 std::vector <GLuint> min_wall_dists_hierarchy;
 
-                // FLOOR OF THE omega THAT DIVIDES THE CROSS DIFFUSION SOURCE (and the F1 arguments).  omega_min = factor * U_ref / L_ref  [1/s]
-                static constexpr float omega_floor_factor = 1.0f;           // c in omega_min = c U_ref / L_ref
-                float omega_min = 0.0f;
-
                 SST_additions(k_TurbulenceModels &k_model_in);
-
-                // omega_min = c * U_ref / min(L_turbulence, longest domain side). Prints a warning (and leaves omega_min = 0) when U_ref or L is not a positive number.
-                void set_omega_floor(float reference_velocity, float turbulence_length_scale);
 
                 void compute_structured_mesh_cell_min_dists();
                 void compute_blended_coefficient_field(GLuint omega_field);    
                 void assemble_cross_diffusion_contribution();
+                // coarse multigrid level: only the diagonal (Patankar) part of the cross diffusion, from the restricted old k / omega / F1 of that level
+                void assemble_cross_diffusion_diagonal_coarse(int cells_x, int cells_y, int cells_z, GLuint k_coarse, GLuint omega_coarse, GLuint F1_coarse, GLuint aP_coarse, GLuint unused_rhs);
                 void assemble_coarse_level_hierarchy_blended_coefficient(std::vector <GLuint> &destruction_variable_hierarchy);
 
                 void SST_preprocessing(GLuint &omega_field, std::vector <GLuint> &destruction_variable_hierarchy);

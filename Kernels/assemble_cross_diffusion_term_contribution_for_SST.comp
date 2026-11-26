@@ -24,8 +24,14 @@ layout(std430, binding = 3) buffer F1_VALUES_FIELD
     float blended_coefficient[];
 };
 
+// diagonal of the omega system: the part of the cross diffusion that is treated implicitly is added here (Patankar, see the end of main)
+layout(std430, binding = 4) buffer AP_OMEGA
+{
+    float aP[];
+};
+
+uniform int ap_only;            // 1: write only the aP increment, never the RHS (coarse multigrid levels: their RHS is a restricted residual, not a source)
 uniform float density;
-uniform float omega_min;        // floor of the omega that DIVIDES the source, see the note at the division below
 uniform uint grid_x;
 uniform uint grid_y;
 uniform uint grid_z;
@@ -91,17 +97,36 @@ void main()
     
     float dot_grad_k_grad_omega = (grad_k.x * grad_omega.x) + (grad_k.y * grad_omega.y) + (grad_k.z * grad_omega.z);
 
-    // THE FLOOR. The source is  (1 - F1) 2 rho sigma_w2 / omega * grad(k).grad(omega)  and is added explicitly (lagged iterate), so the
-    // factor 1/omega is the gain of a feedback loop: omega -> grad(omega) -> source -> omega. Where k and omega are both ~0 (zero or very
-    // low freestream turbulence) 1/omega is astronomically large and the loop diverges. omega_min = c U_ref / L_ref (set on the CPU)
-    // caps that gain. It is only used in this denominator, it is never written into the omega field.
-    // The 1e-12 is a hard guard so an unset uniform (0) can never divide by zero.
-    float omega_value = max(omega[index], max(omega_min, 1e-12));
+    // The 1e-12 is only a guard against dividing by exactly zero.
+    float omega_value = max(omega[index], 1e-12);
 
     float CD_k_omega = (2.0 * density * sigma_omega_2 * (1.0 / omega_value) * dot_grad_k_grad_omega);
     
     float P_omega_CD = (1.0 - blended_coefficient[index]) * CD_k_omega;
 
     float volume = dx * dy * dz;
-    RHS_omega[index] += P_omega_CD * volume;
+
+    // PATANKAR TREATMENT of the source S = P_omega_CD (per unit volume, evaluated from the previous iterate; S is proportional to 1 / omega).
+    // The old explicit treatment put S * volume on the RHS whatever its sign; with omega ~ 0 that is a gain of 1 / omega in a lagged feedback loop
+    // (omega -> grad(omega) -> S -> omega) and the loop diverges. Here the omega dependence of S is passed to the matrix instead:
+    //
+    //   S < 0 (sink)    S_eff = S * omega_new / omega_old                       adds  |S| volume / omega_old  to aP, nothing on the RHS
+    //                   (proportional to the unknown, so omega_new = (...) / (aP + |S| volume / omega_old) cannot change sign)
+    //   S > 0 (source)  S_eff = 2 S - (S / omega_old) * omega_new               adds  S volume / omega_old to aP and 2 S volume to the RHS
+    //                   (first order Taylor expansion of 1 / omega around omega_old: the source falls as omega_new rises and is zero at omega_new = 2 omega_old,
+    //                   so a cell can at most roughly double per nonlinear iteration instead of receiving S in one go)
+    //
+    // Both branches give exactly S when omega_new = omega_old, so the converged solution is the same as with the explicit treatment.
+    // aP only ever increases, so diagonal dominance is never reduced.
+    if (P_omega_CD < 0.0)
+    {
+        aP[index] += (-P_omega_CD) * volume / omega_value;
+    }
+    else
+    {
+        if (ap_only == 0)
+            RHS_omega[index] += 2.0 * P_omega_CD * volume;
+
+        aP[index] += P_omega_CD * volume / omega_value;
+    }
 }

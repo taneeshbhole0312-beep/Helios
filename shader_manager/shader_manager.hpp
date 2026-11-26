@@ -657,7 +657,6 @@ public:
     GLint blended_coefficients_SST_dz;
     GLint blended_coefficients_SST_dynamic_viscosity;
     GLint blended_coefficients_SST_density;
-    GLint blended_coefficients_SST_omega_min;
 
     GLint k_omega_SST_mu_eff_grid_x;
     GLint k_omega_SST_mu_eff_grid_y;
@@ -675,7 +674,7 @@ public:
     GLint assemble_cross_diffusion_SST_dy;
     GLint assemble_cross_diffusion_SST_dz;
     GLint assemble_cross_diffusion_SST_density;
-    GLint assemble_cross_diffusion_SST_omega_min;
+    GLint assemble_cross_diffusion_SST_ap_only;
 
     //--------------------------------------------------
     // k / omega diffusion assembly for the SST model

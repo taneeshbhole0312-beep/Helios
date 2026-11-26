@@ -746,6 +746,13 @@ void k_TurbulenceModels::destruction_variable::construct_destruction_variable_eq
         // destruction on the restricted old k / destruction variable of this level    (NO PRODUCTION AS IT IS COARSE LEVELS)
         assemble_destruction_contribution_destruction_variable(current_cells_x, current_cells_y, current_cells_z, k_model.rans.coefficients_stencil.multigrid_levels_coeffiecients_arr[level], k_model.k_hierarchy[level], destruction_variable_hierarchy[level]);
 
+        // SST: the diagonal part of the cross diffusion (same increment as the fine operator, from the restricted fields of this level)
+        if (k_model.is_SST)
+        {
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            k_model.sst->assemble_cross_diffusion_diagonal_coarse(current_cells_x, current_cells_y, current_cells_z, k_model.k_hierarchy[level], destruction_variable_hierarchy[level], k_model.sst->blended_coefficient_hierarchy[level], k_model.rans.coefficients_stencil.multigrid_levels_coeffiecients_arr[level].aP, k_model.rans.coefficients_stencil.RHS_main);
+        }
+
         if(k_model.is_omega_based)
         {
             apply_omega_wall_treatment_for_k_omega_model(current_cells_x, current_cells_y, current_cells_z, k_model.rans.coefficients_stencil.multigrid_levels_coeffiecients_arr[level]);
@@ -1079,11 +1086,9 @@ bool k_TurbulenceModels::destruction_variable::initialize_k_omega_RANS_fields(fl
     apply_omega_wall_treatment_for_k_omega_model(spalding_wall_smoothness);
     k_model.apply_k_wall_treatment_for_k_omega_model(spalding_wall_smoothness);
 
-    // SST ONLY: freestream omega floor of the cross diffusion term, built from the same two inputs (U_ref, length scale) that fix k0 and omega0,
-    // and the positivity floor on the freshly initialised fields (with zero turbulence intensity k0 = omega0 = 0 exactly)
+    // SST ONLY: positivity clamp on the freshly initialised fields (with zero turbulence intensity k0 = omega0 = 0 exactly)
     if (is_SST && k_model.sst)
     {
-        k_model.sst->set_omega_floor(reference_velocity, turbulence_length_scale);
         enforce_positivity();
     }
 
@@ -1203,24 +1208,6 @@ k_TurbulenceModels::SST_additions::SST_additions(k_TurbulenceModels &k_model_in)
     }
 }
 
-// omega_min = c U_ref / L_ref.
-void k_TurbulenceModels::SST_additions::set_omega_floor(float reference_velocity, float turbulence_length_scale)
-{
-    omega_min = 0.0f;
-
-    const float longest_domain_side = std::max(k_model.rans.domain_size_x, std::max(k_model.rans.domain_size_y, k_model.rans.domain_size_z));
-    const float length_ref = std::min(turbulence_length_scale, longest_domain_side);
-
-    if (!std::isfinite(reference_velocity) || !(std::fabs(reference_velocity) > 0.0f) || !std::isfinite(length_ref) || !(length_ref > 0.0f))
-    {
-        std::cerr << "SST warning: the omega floor of the cross diffusion term needs a non-zero reference velocity and a positive length scale (got U_ref = "
-                  << reference_velocity << ", L = " << turbulence_length_scale << "); the floor is OFF and the run can diverge where k and omega are ~0\n";
-        return;
-    }
-
-    omega_min = omega_floor_factor * std::fabs(reference_velocity) / length_ref;
-}
-
 void k_TurbulenceModels::SST_additions::compute_structured_mesh_cell_min_dists()
 {
     glUseProgram(k_model.rans.shadermanager.compute_min_wall_dists_structured_mesh);
@@ -1258,7 +1245,8 @@ void k_TurbulenceModels::SST_additions::compute_structured_mesh_cell_min_dists(i
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
 
-// Cross diffusion source 2 (1 - F1) rho sigma_omega2 / omega * grad(k).grad(omega), added explicitly to the omega RHS (omega equation only, assembled after k is solved)
+// Cross diffusion source 2 (1 - F1) rho sigma_omega2 / omega * grad(k).grad(omega) of the omega equation (omega equation only, assembled after k is solved).
+// Patankar treatment (see the kernel): the omega dependence of the source goes into the diagonal aP, the rest into the RHS. Run AFTER the other omega contributions and BEFORE the wall treatment.
 void k_TurbulenceModels::SST_additions::assemble_cross_diffusion_contribution()
 {
     glUseProgram(k_model.rans.shadermanager.assemble_cross_diffusion_SST);
@@ -1267,6 +1255,8 @@ void k_TurbulenceModels::SST_additions::assemble_cross_diffusion_contribution()
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, k_model.rans.previous_iterate_eps);       // old omega, same as the production / destruction of the omega equation
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, k_model.rans.previous_iterate_k);         // old k
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, blended_coefficient);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, k_model.rans.coefficients_stencil.coefficients.aP);
+    glUniform1i(k_model.rans.shadermanager.assemble_cross_diffusion_SST_ap_only, 0);
 
     glUniform1ui(k_model.rans.shadermanager.assemble_cross_diffusion_SST_grid_x, k_model.rans.cells_x);
     glUniform1ui(k_model.rans.shadermanager.assemble_cross_diffusion_SST_grid_y, k_model.rans.cells_y);
@@ -1275,9 +1265,34 @@ void k_TurbulenceModels::SST_additions::assemble_cross_diffusion_contribution()
     glUniform1f(k_model.rans.shadermanager.assemble_cross_diffusion_SST_dy, float(k_model.rans.domain_size_y / k_model.rans.cells_y));
     glUniform1f(k_model.rans.shadermanager.assemble_cross_diffusion_SST_dz, float(k_model.rans.domain_size_z / k_model.rans.cells_z));
     glUniform1f(k_model.rans.shadermanager.assemble_cross_diffusion_SST_density, k_model.rans.density);
-    glUniform1f(k_model.rans.shadermanager.assemble_cross_diffusion_SST_omega_min, omega_min);
 
     glDispatchCompute((k_model.rans.cells_x + 7) / 8, (k_model.rans.cells_y + 7) / 8, (k_model.rans.cells_z + 7) / 8);
+
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+}
+
+// Coarse multigrid level version: the fine operator now carries the diagonal part of the cross diffusion, so every coarse operator gets the same
+// increment, evaluated from the restricted old k, omega and F1 of its level. Nothing is written to a RHS (a coarse RHS is a restricted residual).
+void k_TurbulenceModels::SST_additions::assemble_cross_diffusion_diagonal_coarse(int cx, int cy, int cz, GLuint k_coarse, GLuint omega_coarse, GLuint F1_coarse, GLuint aP_coarse, GLuint unused_rhs)
+{
+    glUseProgram(k_model.rans.shadermanager.assemble_cross_diffusion_SST);
+
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, unused_rhs);          // bound only because the kernel declares it, never written (ap_only = 1)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, omega_coarse);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, k_coarse);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, F1_coarse);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, aP_coarse);
+
+    glUniform1ui(k_model.rans.shadermanager.assemble_cross_diffusion_SST_grid_x, cx);
+    glUniform1ui(k_model.rans.shadermanager.assemble_cross_diffusion_SST_grid_y, cy);
+    glUniform1ui(k_model.rans.shadermanager.assemble_cross_diffusion_SST_grid_z, cz);
+    glUniform1f(k_model.rans.shadermanager.assemble_cross_diffusion_SST_dx, float(k_model.rans.domain_size_x / cx));
+    glUniform1f(k_model.rans.shadermanager.assemble_cross_diffusion_SST_dy, float(k_model.rans.domain_size_y / cy));
+    glUniform1f(k_model.rans.shadermanager.assemble_cross_diffusion_SST_dz, float(k_model.rans.domain_size_z / cz));
+    glUniform1f(k_model.rans.shadermanager.assemble_cross_diffusion_SST_density, k_model.rans.density);
+    glUniform1i(k_model.rans.shadermanager.assemble_cross_diffusion_SST_ap_only, 1);
+
+    glDispatchCompute((cx + 7) / 8, (cy + 7) / 8, (cz + 7) / 8);
 
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
@@ -1300,7 +1315,6 @@ void k_TurbulenceModels::SST_additions::compute_blended_coefficient_field(GLuint
     glUniform1f(k_model.rans.shadermanager.blended_coefficients_SST_dz, float(k_model.rans.domain_size_z / k_model.rans.cells_z));
     glUniform1f(k_model.rans.shadermanager.blended_coefficients_SST_dynamic_viscosity, k_model.rans.dynamic_viscosity);
     glUniform1f(k_model.rans.shadermanager.blended_coefficients_SST_density, k_model.rans.density);
-    glUniform1f(k_model.rans.shadermanager.blended_coefficients_SST_omega_min, omega_min);
 
     glDispatchCompute((k_model.rans.cells_x + 7) / 8, (k_model.rans.cells_y + 7) / 8, (k_model.rans.cells_z + 7) / 8);
 
@@ -1324,7 +1338,6 @@ void k_TurbulenceModels::SST_additions::compute_blended_coefficient_field(int cu
     glUniform1f(k_model.rans.shadermanager.blended_coefficients_SST_dz, float(k_model.rans.domain_size_z / current_cells_z));
     glUniform1f(k_model.rans.shadermanager.blended_coefficients_SST_dynamic_viscosity, k_model.rans.dynamic_viscosity);
     glUniform1f(k_model.rans.shadermanager.blended_coefficients_SST_density, k_model.rans.density);
-    glUniform1f(k_model.rans.shadermanager.blended_coefficients_SST_omega_min, omega_min);
 
     glDispatchCompute((current_cells_x + 7) / 8, (current_cells_y + 7) / 8, (current_cells_z + 7) / 8);
 

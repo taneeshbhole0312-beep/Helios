@@ -543,7 +543,6 @@ ShaderManager::ShaderManager()
     blended_coefficients_SST_dz = glGetUniformLocation(compute_blended_coefficients_SST, "dz");
     blended_coefficients_SST_dynamic_viscosity = glGetUniformLocation(compute_blended_coefficients_SST, "dynamic_viscosity");
     blended_coefficients_SST_density = glGetUniformLocation(compute_blended_coefficients_SST, "density");
-    blended_coefficients_SST_omega_min = glGetUniformLocation(compute_blended_coefficients_SST, "omega_min");
 
     k_omega_SST_mu_eff_grid_x = glGetUniformLocation(k_omega_SST_mu_eff, "grid_x");
     k_omega_SST_mu_eff_grid_y = glGetUniformLocation(k_omega_SST_mu_eff, "grid_y");
@@ -561,7 +560,7 @@ ShaderManager::ShaderManager()
     assemble_cross_diffusion_SST_dy = glGetUniformLocation(assemble_cross_diffusion_SST, "dy");
     assemble_cross_diffusion_SST_dz = glGetUniformLocation(assemble_cross_diffusion_SST, "dz");
     assemble_cross_diffusion_SST_density = glGetUniformLocation(assemble_cross_diffusion_SST, "density");
-    assemble_cross_diffusion_SST_omega_min = glGetUniformLocation(assemble_cross_diffusion_SST, "omega_min");
+    assemble_cross_diffusion_SST_ap_only = glGetUniformLocation(assemble_cross_diffusion_SST, "ap_only");
 
     diffusion_k_omega_SST_assemble_grid_x = glGetUniformLocation(diffusion_k_omega_SST_assemble, "grid_x");
     diffusion_k_omega_SST_assemble_grid_y = glGetUniformLocation(diffusion_k_omega_SST_assemble, "grid_y");

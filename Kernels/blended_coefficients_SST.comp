@@ -24,7 +24,6 @@ layout(std430, binding = 3) buffer F1_VALUES_FIELD
 
 uniform float dynamic_viscosity;
 uniform float density;
-uniform float omega_min;        // same floor as the cross diffusion kernel, so F1 and the source see the same omega
 uniform uint grid_x;
 uniform uint grid_y;
 uniform uint grid_z;
@@ -94,8 +93,8 @@ void main()
 
     float wall_dist = max(near_wall_dists[index], 1e-12);
 
-    // omega floor used in every division below (single floor, see assemble_cross_diffusion_term_contribution_for_SST.comp)
-    float omega_value = max(omega[index], max(omega_min, 1e-12));
+    // the 1e-12 is only a guard against dividing by exactly zero
+    float omega_value = max(omega[index], 1e-12);
 
     float k_value = max(k[index], 0.0);
     float nu = dynamic_viscosity / max(density, 1e-12);
